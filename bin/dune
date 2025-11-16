@@ -1,0 +1,10 @@
+(executable
+ (name main)
+ (libraries bos cmdargs ilqr_vae)
+ (preprocess
+  (pps ppx_sexp_message)))
+
+(env
+ (dev
+  (flags
+   (:standard -warn-error -A))))
