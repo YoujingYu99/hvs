@@ -11,21 +11,20 @@ let _ =
   Owl_stats_prng.init (Random.int 100000)
 
 
-let in_dir = Cmdargs.in_dir "-d"
-let data_folder = Option.value (Cmdargs.get_string "-data") ~default:"DH1"
+let in_dir = Cmdargs.in_dir "-results"
+let data_folder = Option.value_exn (Cmdargs.get_string "-data")
 
 (* -----------------------------------------
    -- Data Read In ---
    ----------------------------------------- *)
 
-let load_npy_data hvs_folder =
-  let folder_path = "_data/hvs_npy/" ^ hvs_folder in
+let load_npy_data data_folder =
   (* get list of .npy files, each contains a mat of shape [T x n_channels]. n_channels
     are organized as [AP x ML]. *)
-  let files = Stdlib.Sys.readdir folder_path |> List.of_array in
+  let files = Stdlib.Sys.readdir data_folder |> List.of_array in
   let npy_files = List.filter ~f:(fun f -> Stdlib.Filename.check_suffix f ".npy") files in
   let full_paths =
-    List.map ~f:(fun filename -> Stdlib.Filename.concat folder_path filename) npy_files
+    List.map ~f:(fun filename -> Stdlib.Filename.concat data_folder filename) npy_files
   in
   (* load data *)
   List.map ~f:(fun path -> Arr.load_npy path) full_paths
@@ -73,6 +72,7 @@ let data_train, data_test =
   List.split_n data Float.(to_int (of_int full_batch_size * 0.8))
 
 
+(* 1760 if tmax=400 *)
 let data_train_size = List.length data_train
 
 (* array of length [n_trials], each o has shape [tmax x n_channels] *)
@@ -133,7 +133,7 @@ end
 (* -----------------------------------------
    -- Initialise parameters and train
    ----------------------------------------- *)
-let max_iter = 2000
+let max_iter = 200000
 
 (* sampling frequency of the data *)
 let fs = 651.
@@ -141,10 +141,10 @@ let dt = Float.(1. / fs)
 let tau = 0.02
 
 (* state dim *)
-let n = Option.value (Cmdargs.get_int "-n") ~default:20
+let n = Option.value_exn (Cmdargs.get_int "-n")
 
 (* control dim *)
-let m = 4
+let m = Option.value_exn (Cmdargs.get_int "-m")
 
 (* observation dim *)
 let n_output = 16 * 16
@@ -210,20 +210,24 @@ let config _k = Opt.Shampoo.{ beta = 0.95; learning_rate = Some 0.1 }
 let rec iter ~k state =
   if k % 200 = 0 then Optimizer.save ~out:(in_dir "state.bin") state;
   let prms = C.broadcast (Optimizer.v state) in
-  if Int.(k % 200 = 0) then save_results (in_dir "final") prms data;
+  (* if Int.(k % 200 = 0)
+  then (
+    let test_loss, _ =
+      Model.elbo_gradient ~n_samples:100 ~conv_threshold:1E-4 prms data_test
+    in
+    (if C.first
+     then
+       AA.(
+         save_txt
+           ~append:true
+           ~out:(in_dir "test_loss")
+           (of_array [| test_loss |] [| 1; 1 |])));
+    save_results (in_dir "final") prms data); *)
   let loss, g =
-    Model.elbo_gradient ~n_samples:100 ~mini_batch:8 ~conv_threshold:1E-4 prms data
-  in
-  let test_loss, _ =
-    Model.elbo_gradient ~n_samples:100 ~conv_threshold:1E-4 prms data_test
+    Model.elbo_gradient ~n_samples:100 ~mini_batch:32 ~conv_threshold:1E-4 prms data
   in
   (if C.first
-   then
-     AA.(
-       save_txt
-         ~append:true
-         ~out:(in_dir "loss")
-         (of_array [| loss; test_loss |] [| 1; 2 |])));
+   then AA.(save_txt ~append:true ~out:(in_dir "loss") (of_array [| loss |] [| 1; 1 |])));
   print [%message (k : int) (loss : float)];
   let state =
     match g with
