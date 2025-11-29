@@ -1,3 +1,3 @@
-(lang dune 3.20)
+(lang dune 3.8)
 
 (name hvs)

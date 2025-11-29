@@ -15,6 +15,20 @@ let in_dir = Cmdargs.in_dir "-results"
 let data_folder = Option.value_exn (Cmdargs.get_string "-data")
 
 (* -----------------------------------------
+   ---- Training Arguments -----
+   ----------------------------------------- *)
+let tmax = 400
+let n_trials_save = 100
+let max_iter = 200000
+
+(* state dim *)
+let n = Option.value_exn (Cmdargs.get_int "-n")
+
+(* control dim *)
+let m = Option.value_exn (Cmdargs.get_int "-m")
+let mini_batch = 4
+
+(* -----------------------------------------
    -- Data Read In ---
    ----------------------------------------- *)
 
@@ -31,14 +45,13 @@ let load_npy_data data_folder =
 
 
 (* array of [T x n_channels] files. *)
-let data_raw = load_npy_data data_folder
-
 let standardize (mat : Mat.mat) : Mat.mat =
   let mean_ = Mat.mean ~axis:0 mat in
   let std_ = Mat.std ~axis:0 mat in
   Mat.(div (mat - mean_) std_)
 
 
+(* chunk into length of [tmax] *)
 let chunking ~tmax mat =
   let shape = Arr.shape mat in
   let t = shape.(0) in
@@ -47,44 +60,41 @@ let chunking ~tmax mat =
     Arr.get_slice [ [ tmax * i; (tmax * (i + 1)) - 1 ]; [] ] mat)
 
 
-let tmax = 400
+let pack_data o = { Vae.u = None; z = None; o = AD.pack_arr o }
 
-(* array of [tmax x n_channels] files *)
-let data =
-  let chunk_lst =
-    List.map data_raw ~f:(fun mat ->
-      (* TODO: standardise per time series *)
-      let mat = standardize mat in
-      let tmax_mat = Mat.row_num mat in
-      if tmax_mat < tmax then None else Some (chunking ~tmax mat))
-  in
-  List.concat
-    (List.filter_map
-       ~f:(function
-         | Some lst -> Some lst
-         | None -> None)
-       chunk_lst)
-  |> List.permute
+let chunk_data_mat data =
+  List.map data ~f:(fun mat ->
+    let mat = standardize mat in
+    let tmax_mat = Mat.row_num mat in
+    if tmax_mat < tmax then None else Some (chunking ~tmax mat))
 
 
-let data_train, data_test =
-  let full_batch_size = List.length data in
-  List.split_n data Float.(to_int (of_int full_batch_size * 0.8))
-
-
-(* 1760 if tmax=400 *)
-let data_train_size = List.length data_train
-
-(* array of length [n_trials], each o has shape [tmax x n_channels] *)
-let sample_data bs () =
-  if bs > 0
-  then (
-    let indices =
-      List.permute (List.range 0 data_train_size) |> List.sub ~pos:0 ~len:bs
+(* Load + preprocess only on rank 0 *)
+let data_train, train_batch_size, data_save_results, data_test =
+  C.broadcast' (fun () ->
+    let data_full =
+      load_npy_data data_folder
+      |> chunk_data_mat
+      |> List.filter_map ~f:(fun x -> x)
+      |> List.concat
+      |> List.permute
     in
-    let bs_of_data = List.map indices ~f:(fun idx -> List.nth_exn data idx) in
-    bs_of_data |> List.to_array)
-  else data_test |> List.to_array
+    let full_batch_size = List.length data_full in
+    let data_train, data_test =
+      List.split_n data_full Float.(to_int (of_int full_batch_size *. 0.8))
+    in
+    let data_train = List.map data_train ~f:pack_data in
+    let train_batch_size = List.length data_train in
+    let data_save_results =
+      List.permute (List.range 0 train_batch_size)
+      |> List.sub ~pos:0 ~len:n_trials_save
+      |> List.map ~f:(List.nth_exn data_train)
+    in
+    let data_test = List.map data_test ~f:pack_data in
+    ( List.to_array data_train
+    , train_batch_size
+    , List.to_array data_save_results
+    , List.to_array data_test ))
 
 
 (* -----------------------------------------
@@ -133,22 +143,14 @@ end
 (* -----------------------------------------
    -- Initialise parameters and train
    ----------------------------------------- *)
-let max_iter = 200000
-
 (* sampling frequency of the data *)
 let fs = 651.
 let dt = Float.(1. / fs)
 let tau = 0.02
 
-(* state dim *)
-let n = Option.value_exn (Cmdargs.get_int "-n")
-
-(* control dim *)
-let m = Option.value_exn (Cmdargs.get_int "-m")
-
 (* observation dim *)
 let n_output = 16 * 16
-let setup = { n; m; n_trials = 512; n_steps = tmax }
+let setup = { n; m; n_trials = train_batch_size; n_steps = tmax }
 
 module M = Make_model (struct
     let setup = setup
@@ -156,16 +158,6 @@ module M = Make_model (struct
   end)
 
 open M
-
-let data =
-  let o = sample_data setup.n_trials () in
-  Array.map o ~f:(fun o -> { u = None; z = None; o = AD.pack_arr o })
-
-
-let data_test =
-  let o = sample_data Int.(neg 1) () in
-  Array.map o ~f:(fun o -> { u = None; z = None; o = AD.pack_arr o })
-
 
 let init_prms () =
   C.broadcast' (fun () ->
@@ -180,7 +172,6 @@ let init_prms () =
 
 
 let save_results prefix prms data =
-  let prms = C.broadcast prms in
   let file s = prefix ^ "." ^ s in
   C.root_perform (fun () ->
     Misc.save_bin ~out:(file "params.bin") prms;
@@ -206,34 +197,35 @@ let save_results prefix prms data =
 module Optimizer = Opt.Shampoo.Make (Model.P)
 
 let config _k = Opt.Shampoo.{ beta = 0.95; learning_rate = Some 0.1 }
+let t0 = Unix.gettimeofday ()
 
 let rec iter ~k state =
-  if k % 200 = 0 then Optimizer.save ~out:(in_dir "state.bin") state;
-  let prms = C.broadcast (Optimizer.v state) in
+  let prms = Model.broadcast_prms (Optimizer.v state) in
   (* if Int.(k % 200 = 0)
   then (
     let test_loss, _ =
       Model.elbo_gradient ~n_samples:100 ~conv_threshold:1E-4 prms data_test
     in
-    (if C.first
-     then
-       AA.(
-         save_txt
-           ~append:true
-           ~out:(in_dir "test_loss")
-           (of_array [| test_loss |] [| 1; 1 |])));
-    save_results (in_dir "final") prms data); *)
+    (if C.first then Optimizer.save ~out:(in_dir "state.bin") state;
+     AA.(
+       save_txt
+         ~append:true
+         ~out:(in_dir "test_loss")
+         (of_array [| test_loss |] [| 1; 1 |])));
+    save_results (in_dir "final") prms data_save_results); *)
   let loss, g =
-    Model.elbo_gradient ~n_samples:100 ~mini_batch:32 ~conv_threshold:1E-4 prms data
+    Model.elbo_gradient ~n_samples:100 ~mini_batch ~conv_threshold:1E-4 prms data_train
   in
   (if C.first
    then AA.(save_txt ~append:true ~out:(in_dir "loss") (of_array [| loss |] [| 1; 1 |])));
-  print [%message (k : int) (loss : float)];
   let state =
     match g with
     | None -> state
     | Some g -> Optimizer.step ~config:(config k) ~info:g state
   in
+  let t1 = Unix.gettimeofday () in
+  let time_elapsed = t1 -. t0 in
+  print [%message (k : int) (time_elapsed : float) (loss : float)];
   if k < max_iter then iter ~k:(k + 1) state else Optimizer.v state
 
 
@@ -246,4 +238,4 @@ let final_prms =
   iter ~k:0 state
 
 
-let _ = save_results (in_dir "final") final_prms data
+let _ = save_results (in_dir "final") final_prms data_save_results
