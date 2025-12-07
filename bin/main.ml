@@ -19,14 +19,14 @@ let data_folder = Option.value_exn (Cmdargs.get_string "-data")
    ----------------------------------------- *)
 let tmax = 400
 let n_trials_save = 100
-let max_iter = 200000
+let max_iter = 10000
 
 (* state dim *)
 let n = Option.value_exn (Cmdargs.get_int "-n")
 
 (* control dim *)
 let m = Option.value_exn (Cmdargs.get_int "-m")
-let mini_batch = 4
+let mini_batch = 32
 
 (* -----------------------------------------
    -- Data Read In ---
