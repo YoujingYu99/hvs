@@ -69,6 +69,17 @@ let chunk_data_mat data =
     if tmax_mat < tmax then None else Some (chunking ~tmax mat))
 
 
+(* truncate such that length of [data] is a multiple of [mb]. *)
+let truncate data mb =
+  let n_total = List.length data in
+  let n_mb =
+    let ratio = Float.of_int n_total /. Float.of_int mb in
+    Float.round_down ratio |> Int.of_float
+  in
+  let keep = n_mb * mb in
+  List.sub data ~pos:0 ~len:keep
+
+
 (* Load + preprocess only on rank 0 *)
 let data_train, train_batch_size, data_save_results, data_test =
   C.broadcast' (fun () ->
@@ -91,6 +102,7 @@ let data_train, train_batch_size, data_save_results, data_test =
       |> List.map ~f:(List.nth_exn data_train)
     in
     let data_test = List.map data_test ~f:pack_data in
+    let data_test = truncate data_test mini_batch in
     ( List.to_array data_train
     , train_batch_size
     , List.to_array data_save_results
@@ -204,7 +216,11 @@ let rec iter ~k state =
   if Int.(k % 200 = 0)
   then (
     let test_loss =
-      Model.elbo_no_gradient ~n_samples:100 ~conv_threshold:1E-4 prms data_test
+      Model.elbo_no_gradient
+        ~n_samples:100
+        ~conv_threshold:1E-4
+        (Model.P.value prms)
+        data_test
     in
     if C.first
     then (
@@ -236,7 +252,7 @@ let rec iter ~k state =
   if k < max_iter then iter ~k:(k + 1) state else Optimizer.v state
 
 
-(* let final_prms =
+let final_prms =
   let state =
     match Cmdargs.get_string "-reuse" with
     | Some file -> Optimizer.load file
@@ -245,16 +261,21 @@ let rec iter ~k state =
   iter ~k:0 state
 
 
-let _ = save_results (in_dir "final") final_prms data_save_results *)
+let _ = save_results (in_dir "final") final_prms data_save_results
 
 (* compute validation loss from available models *)
 
 let _ =
-  let final_prms_state = Optimizer.load (in_dir "final_params.bin") in
-  let final_prms = Model.broadcast_prms (Optimizer.v final_prms_state) in
+  let (prms_final : Model.P.t') =
+    C.broadcast' (fun () -> Misc.read_bin (in_dir "final.params.bin") |> Model.P.value)
+  in
   let test_loss =
-    Model.elbo_no_gradient ~n_samples:100 ~conv_threshold:1E-4 final_prms data_test
+    Model.elbo_no_gradient ~n_samples:100 ~conv_threshold:1E-4 prms_final data_test
   in
   if C.first
   then
-    AA.(save_txt ~append:true ~out:(in_dir "loss") (of_array [| test_loss |] [| 1; 1 |]))
+    AA.(
+      save_txt
+        ~append:true
+        ~out:(in_dir "final_test_loss")
+        (of_array [| test_loss |] [| 1; 1 |]))
