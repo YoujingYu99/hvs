@@ -201,23 +201,30 @@ let t0 = Unix.gettimeofday ()
 
 let rec iter ~k state =
   let prms = Model.broadcast_prms (Optimizer.v state) in
-  (* if Int.(k % 200 = 0)
+  if Int.(k % 200 = 0)
   then (
-    let test_loss, _ =
-      Model.elbo_gradient ~n_samples:100 ~conv_threshold:1E-4 prms data_test
+    let test_loss =
+      Model.elbo_no_gradient ~n_samples:100 ~conv_threshold:1E-4 prms data_test
     in
-    (if C.first then Optimizer.save ~out:(in_dir "state.bin") state;
-     AA.(
-       save_txt
-         ~append:true
-         ~out:(in_dir "test_loss")
-         (of_array [| test_loss |] [| 1; 1 |])));
-    save_results (in_dir "final") prms data_save_results); *)
+    if C.first
+    then (
+      Optimizer.save ~out:(in_dir "state.bin") state;
+      AA.(
+        save_txt
+          ~append:true
+          ~out:(in_dir "test_loss")
+          (of_array [| Float.of_int k; test_loss |] [| 1; 2 |])));
+    save_results (in_dir "final") prms data_save_results);
   let loss, g =
     Model.elbo_gradient ~n_samples:100 ~mini_batch ~conv_threshold:1E-4 prms data_train
   in
   (if C.first
-   then AA.(save_txt ~append:true ~out:(in_dir "loss") (of_array [| loss |] [| 1; 1 |])));
+   then
+     AA.(
+       save_txt
+         ~append:true
+         ~out:(in_dir "loss")
+         (of_array [| Float.of_int k; loss |] [| 1; 2 |])));
   let state =
     match g with
     | None -> state
