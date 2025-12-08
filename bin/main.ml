@@ -236,7 +236,7 @@ let rec iter ~k state =
   if k < max_iter then iter ~k:(k + 1) state else Optimizer.v state
 
 
-let final_prms =
+(* let final_prms =
   let state =
     match Cmdargs.get_string "-reuse" with
     | Some file -> Optimizer.load file
@@ -245,4 +245,16 @@ let final_prms =
   iter ~k:0 state
 
 
-let _ = save_results (in_dir "final") final_prms data_save_results
+let _ = save_results (in_dir "final") final_prms data_save_results *)
+
+(* compute validation loss from available models *)
+
+let _ =
+  let final_prms_state = Optimizer.load (in_dir "final_params.bin") in
+  let final_prms = Model.broadcast_prms (Optimizer.v final_prms_state) in
+  let test_loss =
+    Model.elbo_no_gradient ~n_samples:100 ~conv_threshold:1E-4 final_prms data_test
+  in
+  if C.first
+  then
+    AA.(save_txt ~append:true ~out:(in_dir "loss") (of_array [| test_loss |] [| 1; 1 |]))
