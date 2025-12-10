@@ -17,7 +17,6 @@ let data_folder = Option.value_exn (Cmdargs.get_string "-data")
 (* -----------------------------------------
    ---- Training Arguments -----
    ----------------------------------------- *)
-let tmax = 400
 let n_trials_save = 100
 let max_iter = 10000
 
@@ -32,42 +31,7 @@ let mini_batch = 32
    -- Data Read In ---
    ----------------------------------------- *)
 
-let load_npy_data data_folder =
-  (* get list of .npy files, each contains a mat of shape [T x n_channels]. n_channels
-    are organized as [AP x ML]. *)
-  let files = Stdlib.Sys.readdir data_folder |> List.of_array in
-  let npy_files = List.filter ~f:(fun f -> Stdlib.Filename.check_suffix f ".npy") files in
-  let full_paths =
-    List.map ~f:(fun filename -> Stdlib.Filename.concat data_folder filename) npy_files
-  in
-  (* load data *)
-  List.map ~f:(fun path -> Arr.load_npy path) full_paths
-
-
-(* array of [T x n_channels] files. *)
-let standardize (mat : Mat.mat) : Mat.mat =
-  let mean_ = Mat.mean ~axis:0 mat in
-  let std_ = Mat.std ~axis:0 mat in
-  Mat.(div (mat - mean_) std_)
-
-
-(* chunk into length of [tmax] *)
-let chunking ~tmax mat =
-  let shape = Arr.shape mat in
-  let t = shape.(0) in
-  let num_blocks = t / tmax in
-  List.init num_blocks ~f:(fun i ->
-    Arr.get_slice [ [ tmax * i; (tmax * (i + 1)) - 1 ]; [] ] mat)
-
-
-let pack_data o = { Vae.u = None; z = None; o = AD.pack_arr o }
-
-let chunk_data_mat data =
-  List.map data ~f:(fun mat ->
-    let mat = standardize mat in
-    let tmax_mat = Mat.row_num mat in
-    if tmax_mat < tmax then None else Some (chunking ~tmax mat))
-
+let pack_o o = { Vae.u = None; z = None; o = AD.pack_arr o }
 
 (* truncate such that length of [data] is a multiple of [mb]. *)
 let truncate data mb =
@@ -80,30 +44,68 @@ let truncate data mb =
   List.sub data ~pos:0 ~len:keep
 
 
+let pack_data x =
+  let d0 = (Arr.shape x).(0) in
+  Array.init d0 ~f:(fun i -> pack_o (Arr.get_slice [ [ i ]; []; [] ] x))
+
+
 (* Load + preprocess only on rank 0 *)
-let data_train, train_batch_size, data_save_results, data_test =
+(* let tmax, data_train, train_batch_size, data_save_results, data_test =
   C.broadcast' (fun () ->
-    let data_full =
-      load_npy_data data_folder
-      |> chunk_data_mat
-      |> List.filter_map ~f:(fun x -> x)
-      |> List.concat
-      |> List.permute
+    (* shape [n_trials x tmax x n_channels ]*)
+    let data_full = Arr.load_npy data_dir in
+    let data_shape = Arr.shape data_full in
+    let full_batch_size = data_shape.(0) in
+    let tmax = data_shape.(1) in
+    let train_batch_size = Float.(to_int (of_int full_batch_size *. 0.8)) in
+    let test_batch_size = Int.(full_batch_size - train_batch_size) in
+    let data_train = Arr.get_slice [ [ 0; train_batch_size - 1 ]; []; [] ] data_full in
+    let data_test =
+      Arr.get_slice [ [ train_batch_size; full_batch_size - 1 ]; []; [] ] data_full
     in
+    let data_train = pack_data data_train in
+    let data_test = pack_data data_test in
+    let data_save_results =
+      List.permute (List.range 0 test_batch_size)
+      |> List.sub ~pos:0 ~len:n_trials_save
+      |> List.map ~f:(fun i -> data_test.(i))
+      |> List.to_array
+    in
+    let data_test = truncate data_test mini_batch in
+    tmax, data_train, train_batch_size, data_save_results, data_test) *)
+
+let load_npy_data data_folder =
+  (* get list of .npy files, each contains a mat of shape [tmax x n_channels]. n_channels
+        are organized as [AP x ML]. *)
+  let files = Stdlib.Sys.readdir data_folder |> List.of_array in
+  let npy_files = List.filter ~f:(fun f -> Stdlib.Filename.check_suffix f ".npy") files in
+  let full_paths =
+    List.map ~f:(fun filename -> Stdlib.Filename.concat data_folder filename) npy_files
+  in
+  (* load data *)
+  List.map ~f:(fun path -> Arr.load_npy path) full_paths
+
+
+(* Load + preprocess only on rank 0 *)
+let tmax, data_train, train_batch_size, data_save_results, data_test =
+  C.broadcast' (fun () ->
+    let data_full = load_npy_data data_folder |> List.permute in
     let full_batch_size = List.length data_full in
+    let tmax = (Arr.shape (List.hd_exn data_full)).(0) in
     let data_train, data_test =
       List.split_n data_full Float.(to_int (of_int full_batch_size *. 0.8))
     in
-    let data_train = List.map data_train ~f:pack_data in
+    let data_train = List.map data_train ~f:pack_o in
     let train_batch_size = List.length data_train in
     let data_save_results =
       List.permute (List.range 0 train_batch_size)
       |> List.sub ~pos:0 ~len:n_trials_save
       |> List.map ~f:(List.nth_exn data_train)
     in
-    let data_test = List.map data_test ~f:pack_data in
+    let data_test = List.map data_test ~f:pack_o in
     let data_test = truncate data_test mini_batch in
-    ( List.to_array data_train
+    ( tmax
+    , List.to_array data_train
     , train_batch_size
     , List.to_array data_save_results
     , List.to_array data_test ))
