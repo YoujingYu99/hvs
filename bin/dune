@@ -1,8 +1,8 @@
-(executable
- (name main)
- (libraries bos cmdargs ilqr_vae)
+(executables
+ (names main fa)
+ (libraries bos cmdargs ilqr_vae sofo)
  (preprocess
-  (pps ppx_sexp_message)))
+ (pps ppx_sexp_message ppx-forward-torch)))
 
 (env
  (dev
