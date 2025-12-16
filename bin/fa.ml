@@ -84,12 +84,13 @@ let z_train, z_test =
   , Maths.einsum [ c, "ij"; data_test_t, "klj" ] "kli" )
 
 
+(* TODO: is this the correct formulation? *)
 let sample_data batch_size =
   let z_train_bs = Maths.slice ~dim:0 ~start:0 ~end_:batch_size z_train in
-  (* [bs x tmax-1 x o]*)
+  (* [bs x tmax-1 x o] *)
   let train_data_0 = Maths.slice ~dim:1 ~start:0 ~end_:Int.(tmax - 1) z_train_bs in
   let train_data_1 = Maths.slice ~dim:1 ~start:1 ~end_:Int.(tmax) z_train_bs in
-  (* [bs * tmax-1 x o]*)
+  (* [bs * tmax-1 x o] *)
   Maths.reshape train_data_0 ~shape:[ -1; o ], Maths.reshape train_data_1 ~shape:[ -1; o ]
 
 
@@ -186,9 +187,7 @@ module M = struct
   module P = P
 
   let init : P.param =
-    let c =
-      Prms.Single.free (Maths.of_bigarray ~device:base.device (c_init ~dim:n data_train))
-    in
+    let c = Prms.Single.free (Maths.randn ~device:base.device [ n; n ]) in
     let sigma_o_prms =
       Prms.Single.bounded
         ~above:(Maths.f 0.0001)
@@ -281,7 +280,7 @@ let config =
 let train ~max_iter =
   let rec loop ~t ~state running_avg =
     Stdlib.Gc.major ();
-    let data = sample_data bs in
+    let _, data = sample_data bs in
     let theta = O.params state in
     let theta_ = O.P.value theta in
     let theta_dual =
