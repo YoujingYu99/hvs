@@ -51,8 +51,8 @@ let pack_data x =
     pack_o (Arr.reshape s [| tmax; o_dim |]))
 
 
-(* Use PCA for initialising the C matrix. *)
-let c_init ~dim x =
+(* Compute pcs. x has shape [n_trials x tmax x o] *)
+let pcs ~dim x =
   let x = AA.(reshape x [| -1; (shape x).(2) |]) in
   let x = AA.(x - mean ~axis:0 x) in
   let x = AA.transpose x in
@@ -60,26 +60,76 @@ let c_init ~dim x =
   let x = AA.get_fancy [ R []; L ids ] x in
   (* do an SVD *)
   let u, _, _ = AA.Linalg.svd x in
-  let c = AA.get_slice [ []; [ 0; dim - 1 ] ] u |> fun x -> AA.(x / l2norm ~axis:1 x) in
+  (* pcs has shape [o x dim] *)
+  AA.get_slice [ []; [ 0; dim - 1 ] ] u
+
+
+(* Use PCA for initialising the C matrix. *)
+let c_init pcs =
+  let c = AA.(pcs / l2norm ~axis:1 pcs) in
+  let dim = (AA.shape pcs).(1) in
   let q, _ = AA.Linalg.qr (AA.gaussian [| dim; dim |]) in
   AA.(dot c q)
 
 
+let svd_inv a =
+  let u, s, vh = AA.Linalg.svd a in
+  Mat.(transpose vh / (s *@ transpose u))
+
+
+(* Naively fit the A matrix *)
+let a_naive_fit ~pcs x =
+  let c_inv = svd_inv pcs in
+  let x_shape = Arr.shape x in
+  let n_trials = x_shape.(0)
+  and tmax = x_shape.(1) in
+  let dim = (Arr.shape pcs).(1) in
+  let z_inferred =
+    let x = AA.(reshape x [| -1; (shape x).(2) |]) in
+    let z = Mat.(x *@ transpose c_inv) in
+    AA.reshape z [| n_trials; tmax; -1 |]
+  in
+  let ids = List.range 0 n_trials |> List.permute |> List.sub ~pos:0 ~len:5000 in
+  let z_inferred = AA.get_fancy [ L ids; R []; R [] ] z_inferred in
+  (* [ 5000 x (tmax-1) x dim ] *)
+  let z_1 = AA.get_slice [ []; [ 1; -1 ]; [] ] z_inferred in
+  let z_0 = AA.get_slice [ []; [ 0; -2 ]; [] ] z_inferred in
+  let a =
+    (* [ dim x (5000 x tmax-1) ]*)
+    let z_0_ = AA.reshape z_0 [| -1; dim |] |> AA.transpose in
+    let z_1_ = AA.reshape z_1 [| -1; dim |] |> AA.transpose in
+    let to_inv = Mat.(z_0_ *@ transpose z_0_) in
+    Mat.(z_1_ *@ transpose z_0_ *@ svd_inv to_inv)
+  in
+  z_0, z_1, a
+
+
+let b_init_scale ~z_0 ~z_1 a =
+  let z_shape = AA.shape z_0 in
+  let dim = z_shape.(2) in
+  let z_0_ = AA.(reshape z_0 [| -1; dim |]) in
+  let z_1_ = AA.(reshape z_1 [| -1; dim |]) in
+  let a_z0 = Mat.(z_0_ *@ transpose a) in
+  (* [ 5000 x (tmax-1) x dim ] *)
+  let diff = AA.(reshape (z_1_ - a_z0) z_shape) in
+  AA.std' diff
+
+
+type init_info =
+  { c_init : AA.arr
+  ; a_naive_fit : AA.arr
+  ; b_init_scale : float
+  }
+
 (* Load + preprocess only on rank 0 *)
-let tmax, pcs, data_train, train_batch_size, data_save_results, data_test =
+let tmax, init_info, data_train, train_batch_size, data_save_results, data_test =
   C.broadcast' (fun () ->
     (* shape [n_trials x tmax x n_channels ]*)
     let data_train_npy = Arr.load_npy (data_path ^ "train_std.npy") in
     let data_test_npy = Arr.load_npy (data_path ^ "test_std.npy") in
     let data_train_shape = Arr.shape data_train_npy in
-    (* let full_batch_size = data_shape.(0) in *)
     let train_batch_size = data_train_shape.(0)
     and tmax = data_train_shape.(1) in
-    (* let train_batch_size = Float.(to_int (of_int full_batch_size *. 0.8)) in *)
-    (* let data_train = Arr.get_slice [ [ 0; train_batch_size - 1 ]; []; [] ] data_full in *)
-    (* let data_test =
-      Arr.get_slice [ [ train_batch_size; full_batch_size - 1 ]; []; [] ] data_full
-    in *)
     print
       [%message
         (Arr.shape data_train_npy : int array) (Arr.shape data_test_npy : int array)];
@@ -92,9 +142,17 @@ let tmax, pcs, data_train, train_batch_size, data_save_results, data_test =
       |> List.to_array
     in
     let data_test = truncate data_test mini_batch in
-    let pcs = c_init ~dim:n data_train_npy in
+    let _pcs = pcs ~dim:n data_train_npy in
+    let c_init = c_init _pcs in
+    let z_0, z_1, a_naive_fit = a_naive_fit ~pcs:_pcs data_train_npy in
+    let b_init_scale = b_init_scale ~z_0 ~z_1 a_naive_fit in
     print [%message "Finished computing PCs"];
-    tmax, pcs, data_train, train_batch_size, data_save_results, data_test)
+    ( tmax
+    , { c_init; a_naive_fit; b_init_scale }
+    , data_train
+    , train_batch_size
+    , data_save_results
+    , data_test ))
 
 
 (* -----------------------------------------
@@ -125,7 +183,7 @@ struct
       let normalize_c = false
     end)
 
-  module D = Dynamics.Linear (struct
+  module D = Dynamics.Linear_unconstrained (struct
       let n_beg = P.n_beg
     end)
 
@@ -161,7 +219,7 @@ open M
 
 let reg ~(prms : Model.P.t') =
   let z = Float.(1e-5 / of_int Int.(setup.n * setup.n)) in
-  let a = D.unpack_a ~prms:prms.dynamics in
+  let a = prms.dynamics.a in
   let a_reg = AD.Maths.(F z * l2norm_sqr' a) in
   match prms.dynamics.b with
   | None -> a_reg
@@ -179,12 +237,20 @@ let init_prms () =
     let prior = U.P.map (U.init ~spatial_std:1.0 ~m ()) ~f:Prms.pin in
     let prior_recog = prior in
     (* initialise away from margin *)
-    let dynamics = D.init ~dt_over_tau:Float.(dt / tau) ~alpha:0.5 ~beta:0.5 ~n ~m () in
+    let dynamics =
+      D.P.
+        { a = Prms.create (AD.pack_arr init_info.a_naive_fit)
+        ; b =
+            Some
+              (Prms.create
+                 (AD.Mat.gaussian ~sigma:Float.(init_info.b_init_scale / of_int n) m n))
+        }
+    in
     (* use PCA to initialise C matrix *)
     let likelihood =
       let tmp = L.init ~scale:1. ~sigma2:1. ~n ~n_output () in
       (* tmp *)
-      { tmp with c = Prms.create (AD.pack_arr pcs) }
+      { tmp with c = Prms.create (AD.pack_arr init_info.c_init) }
     in
     Model.init ~prior ~prior_recog ~dynamics ~likelihood ())
 
@@ -195,6 +261,16 @@ let save_results prefix prms data =
     Misc.save_bin ~out:(file "params.bin") prms;
     Model.P.save_txt ~prefix prms);
   let prms = Model.P.value prms in
+  let data_gen = Model.sample_generative ~prms in
+  let process_gen label a =
+    let a = AD.unpack_arr a in
+    AA.reshape a [| setup.n_steps; -1 |]
+    |> AA.save_txt ~out:(file (Printf.sprintf "generated_%s" label))
+  in
+  process_gen "u" (Option.value_exn data_gen.u);
+  process_gen "z" (Option.value_exn data_gen.z);
+  process_gen "o" data_gen.o;
+  (* sample from model using inferred u *)
   Array.iteri data ~f:(fun i dat_trial ->
     if Int.(i % C.n_nodes = C.rank)
     then (
@@ -238,7 +314,6 @@ let rec iter ~k state =
         (Model.P.value prms)
         data_test
     in
-    print [%message (k : int) (test_loss : float)];
     if C.first
     then (
       Optimizer.save ~out:(in_dir "state.bin") state;
@@ -271,7 +346,8 @@ let rec iter ~k state =
   in
   let t1 = Unix.gettimeofday () in
   let time_elapsed = t1 -. t0 in
-  print [%message (k : int) (time_elapsed : float) (loss : float)];
+  if Int.(k % 10 = 0)
+  then print [%message (k : int) (time_elapsed : float) (loss : float)];
   if k < max_iter then iter ~k:(k + 1) state else Optimizer.v state
 
 
