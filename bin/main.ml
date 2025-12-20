@@ -51,13 +51,21 @@ let pack_data x =
     pack_o (Arr.reshape s [| tmax; o_dim |]))
 
 
+(* -----------------------------------------
+   -- Param Init Quantities ---
+   ----------------------------------------- *)
+type init_info =
+  { c_init : AA.arr
+  ; a_init : AA.arr
+  ; b_init_scale : float
+  ; noise_init : AA.arr
+  }
+
 (* Compute pcs. x has shape [n_trials x tmax x o] *)
 let pcs ~dim x =
   let x = AA.(reshape x [| -1; (shape x).(2) |]) in
   let x = AA.(x - mean ~axis:0 x) in
   let x = AA.transpose x in
-  let ids = List.range 0 AA.(shape x).(1) |> List.permute |> List.sub ~pos:0 ~len:5000 in
-  let x = AA.get_fancy [ R []; L ids ] x in
   (* do an SVD *)
   let u, _, _ = AA.Linalg.svd x in
   (* pcs has shape [o x dim] *)
@@ -74,52 +82,58 @@ let c_init pcs =
 
 let svd_inv a =
   let u, s, vh = AA.Linalg.svd a in
-  Mat.(transpose vh / (s *@ transpose u))
+  Mat.(transpose vh / (1e-6 $+ s) *@ transpose u)
 
 
-(* Naively fit the A matrix *)
-let a_naive_fit ~pcs x =
+let z_inferred ~pcs x =
   let c_inv = svd_inv pcs in
   let x_shape = Arr.shape x in
   let n_trials = x_shape.(0)
   and tmax = x_shape.(1) in
-  let dim = (Arr.shape pcs).(1) in
-  let z_inferred =
-    let x = AA.(reshape x [| -1; (shape x).(2) |]) in
-    let z = Mat.(x *@ transpose c_inv) in
-    AA.reshape z [| n_trials; tmax; -1 |]
-  in
-  let ids = List.range 0 n_trials |> List.permute |> List.sub ~pos:0 ~len:5000 in
-  let z_inferred = AA.get_fancy [ L ids; R []; R [] ] z_inferred in
+  let x = AA.(reshape x [| -1; (shape x).(2) |]) in
+  let z = Mat.(x *@ transpose c_inv) in
+  let z = AA.reshape z [| n_trials; tmax; -1 |] in
+  z
+
+
+let z_0 z = AA.get_slice [ []; [ 0; -2 ]; [] ] z
+let z_1 z = AA.get_slice [ []; [ 1; -1 ]; [] ] z
+
+(* Compute info needed for initialising parameters *)
+let param_init_info ~dim x =
+  (* use a subset of x for computation *)
+  let ids = List.range 0 AA.(shape x).(0) |> List.permute |> List.sub ~pos:0 ~len:2 in
+  let x = AA.get_fancy [ L ids; R []; R [] ] x in
+  let pcs = pcs ~dim x in
+  let z = z_inferred ~pcs x in
   (* [ 5000 x (tmax-1) x dim ] *)
-  let z_1 = AA.get_slice [ []; [ 1; -1 ]; [] ] z_inferred in
-  let z_0 = AA.get_slice [ []; [ 0; -2 ]; [] ] z_inferred in
+  let z_0 = z_0 z
+  and z_1 = z_1 z in
+  let z_0_ = AA.reshape z_0 [| -1; dim |] in
+  let z_1_ = AA.reshape z_1 [| -1; dim |] in
+  (* regression to fit state transition matrix *)
   let a =
     (* [ dim x (5000 x tmax-1) ]*)
-    let z_0_ = AA.reshape z_0 [| -1; dim |] |> AA.transpose in
-    let z_1_ = AA.reshape z_1 [| -1; dim |] |> AA.transpose in
+    let z_0_ = AA.transpose z_0_
+    and z_1_ = AA.transpose z_1_ in
     let to_inv = Mat.(z_0_ *@ transpose z_0_) in
     Mat.(z_1_ *@ transpose z_0_ *@ svd_inv to_inv)
   in
-  z_0, z_1, a
+  (* std of state residual for scale of b matrix initialisation *)
+  let b =
+    let a_z0 = Mat.(z_0_ *@ transpose a) in
+    (* [ 5000 x (tmax-1) x dim ] *)
+    let diff = AA.(reshape (z_1_ - a_z0) (shape z_0)) in
+    AA.std' diff
+  in
+  (* std of observation residual for scale of noise initialisation *)
+  let noise_init =
+    let pred = Mat.(reshape z [| -1; dim |] *@ transpose pcs) in
+    let diff = Mat.(reshape x [| -1; (Arr.shape x).(2) |] - pred) in
+    AA.var ~axis:0 ~keep_dims:true diff
+  in
+  { a_init = a; b_init_scale = b; c_init = c_init pcs; noise_init }
 
-
-let b_init_scale ~z_0 ~z_1 a =
-  let z_shape = AA.shape z_0 in
-  let dim = z_shape.(2) in
-  let z_0_ = AA.(reshape z_0 [| -1; dim |]) in
-  let z_1_ = AA.(reshape z_1 [| -1; dim |]) in
-  let a_z0 = Mat.(z_0_ *@ transpose a) in
-  (* [ 5000 x (tmax-1) x dim ] *)
-  let diff = AA.(reshape (z_1_ - a_z0) z_shape) in
-  AA.std' diff
-
-
-type init_info =
-  { c_init : AA.arr
-  ; a_naive_fit : AA.arr
-  ; b_init_scale : float
-  }
 
 (* Load + preprocess only on rank 0 *)
 let tmax, init_info, data_train, train_batch_size, data_save_results, data_test =
@@ -142,17 +156,9 @@ let tmax, init_info, data_train, train_batch_size, data_save_results, data_test 
       |> List.to_array
     in
     let data_test = truncate data_test mini_batch in
-    let _pcs = pcs ~dim:n data_train_npy in
-    let c_init = c_init _pcs in
-    let z_0, z_1, a_naive_fit = a_naive_fit ~pcs:_pcs data_train_npy in
-    let b_init_scale = b_init_scale ~z_0 ~z_1 a_naive_fit in
-    print [%message "Finished computing PCs"];
-    ( tmax
-    , { c_init; a_naive_fit; b_init_scale }
-    , data_train
-    , train_batch_size
-    , data_save_results
-    , data_test ))
+    let init_info = param_init_info ~dim:n data_train_npy in
+    print [%message "Finished computing param init info"];
+    tmax, init_info, data_train, train_batch_size, data_save_results, data_test)
 
 
 (* -----------------------------------------
@@ -236,21 +242,21 @@ let init_prms () =
     (* let prior = U.init ~spatial_std:1.0 ~m () in *)
     let prior = U.P.map (U.init ~spatial_std:1.0 ~m ()) ~f:Prms.pin in
     let prior_recog = prior in
-    (* initialise away from margin *)
     let dynamics =
       D.P.
-        { a = Prms.create (AD.pack_arr init_info.a_naive_fit)
+        { a = Prms.create (AD.pack_arr init_info.a_init)
         ; b =
             Some
               (Prms.create
                  (AD.Mat.gaussian ~sigma:Float.(init_info.b_init_scale / of_int n) m n))
         }
     in
-    (* use PCA to initialise C matrix *)
     let likelihood =
       let tmp = L.init ~scale:1. ~sigma2:1. ~n ~n_output () in
-      (* tmp *)
-      { tmp with c = Prms.create (AD.pack_arr init_info.c_init) }
+      { tmp with
+        c = Prms.create (AD.pack_arr init_info.c_init)
+      ; variances = Prms.create (AD.pack_arr init_info.noise_init)
+      }
     in
     Model.init ~prior ~prior_recog ~dynamics ~likelihood ())
 
@@ -261,15 +267,18 @@ let save_results prefix prms data =
     Misc.save_bin ~out:(file "params.bin") prms;
     Model.P.save_txt ~prefix prms);
   let prms = Model.P.value prms in
-  let data_gen = Model.sample_generative ~prms in
-  let process_gen label a =
-    let a = AD.unpack_arr a in
-    AA.reshape a [| setup.n_steps; -1 |]
-    |> AA.save_txt ~out:(file (Printf.sprintf "generated_%s" label))
-  in
-  process_gen "u" (Option.value_exn data_gen.u);
-  process_gen "z" (Option.value_exn data_gen.z);
-  process_gen "o" data_gen.o;
+  (* sample from model parameters *)
+  C.root_perform (fun () ->
+    let data_gen = Model.sample_generative ~pre:true prms in
+    let process_gen label a =
+      let a = AD.unpack_arr a in
+      AA.reshape a [| setup.n_steps; -1 |]
+      |> AA.save_txt ~out:(file (Printf.sprintf "generated_%s" label))
+    in
+    print [%message "starting saving data_gen "];
+    process_gen "u" (Option.value_exn data_gen.u);
+    process_gen "z" (Option.value_exn data_gen.z);
+    process_gen "o" data_gen.o);
   (* sample from model using inferred u *)
   Array.iteri data ~f:(fun i dat_trial ->
     if Int.(i % C.n_nodes = C.rank)
