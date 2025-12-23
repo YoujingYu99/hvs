@@ -26,6 +26,10 @@ let n = Option.value_exn (Cmdargs.get_int "-n")
 
 (* control dim *)
 let m = Option.value_exn (Cmdargs.get_int "-m")
+
+(* learning rate *)
+let lr = Option.value (Cmdargs.get_float "-decay_rate") ~default:0.001
+let decay_rate = Option.value (Cmdargs.get_float "-decay_rate") ~default:1.
 let mini_batch = 32
 
 (* -----------------------------------------
@@ -103,7 +107,7 @@ let z_1 z = AA.get_slice [ []; [ 1; -1 ]; [] ] z
 (* Compute info needed for initialising parameters *)
 let param_init_info ~dim x =
   (* use a subset of x for computation *)
-  let ids = List.range 0 AA.(shape x).(0) |> List.permute |> List.sub ~pos:0 ~len:5000 in
+  let ids = List.range 0 AA.(shape x).(0) |> List.permute |> List.sub ~pos:0 ~len:500 in
   let x = AA.get_fancy [ L ids; R []; R [] ] x in
   let pcs = pcs ~dim x in
   let z = z_inferred ~pcs x in
@@ -308,7 +312,7 @@ module Optimizer = Opt.Adam.Make (Model.P)
 
 let config _k =
   Opt.Adam.
-    { learning_rate = Some 0.001
+    { learning_rate = Some Float.(lr / (1. + (decay_rate * sqrt (of_int _k))))
     ; epsilon = 1E-4
     ; beta1 = 0.9
     ; beta2 = 0.999
