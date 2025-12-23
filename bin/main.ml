@@ -27,8 +27,14 @@ let n = Option.value_exn (Cmdargs.get_int "-n")
 (* control dim *)
 let m = Option.value_exn (Cmdargs.get_int "-m")
 
+(* whether to use statistics from data to initialise parameters *)
+let a_init = Option.value (Cmdargs.get_bool "-a_init") ~default:false
+let b_init = Option.value (Cmdargs.get_bool "-b_init") ~default:false
+let noise_init = Option.value (Cmdargs.get_bool "-noise_init") ~default:false
+let pin_prior = Option.value (Cmdargs.get_bool "-pin_prior") ~default:false
+
 (* learning rate *)
-let lr = Option.value (Cmdargs.get_float "-decay_rate") ~default:0.001
+let lr = Option.value (Cmdargs.get_float "-lr") ~default:0.001
 let decay_rate = Option.value (Cmdargs.get_float "-decay_rate") ~default:1.
 let mini_batch = 32
 
@@ -61,9 +67,9 @@ let pack_data x =
    ----------------------------------------- *)
 type init_info =
   { c_init : AA.arr
-  ; a_init : AA.arr
-  ; b_init : AA.arr
-  ; noise_init : AA.arr
+  ; a_init : AA.arr option
+  ; b_init : AA.arr option
+  ; noise_init : AA.arr option
   }
 
 (* Compute pcs. x has shape [n_trials x tmax x o] *)
@@ -104,40 +110,72 @@ let z_inferred ~pcs x =
 let z_0 z = AA.get_slice [ []; [ 0; -2 ]; [] ] z
 let z_1 z = AA.get_slice [ []; [ 1; -1 ]; [] ] z
 
+(* regression to fit state transition matrix. a = (z_1 z_0^T)^{-1}(z_0 z_0^T) *)
+let compute_a ~z_0 ~z_1 =
+  (* [ dim x (5000 x tmax-1) ] *)
+  let z_0 = AA.transpose z_0
+  and z_1 = AA.transpose z_1 in
+  let to_inv = Mat.(z_0 *@ transpose z_0) in
+  Mat.(z_1 *@ transpose z_0 *@ svd_inv to_inv)
+
+
+(* std of state residual for scale of b matrix initialisation *)
+let compute_b ~z_0 ~z_1 ~a =
+  let a_z0 = Mat.(z_0 *@ transpose a) in
+  (* [ 5000 x (tmax-1) x dim ] *)
+  let diff = AA.(reshape (z_1 - a_z0) (shape z_0)) in
+  AA.std ~axis:0 ~keep_dims:true diff
+
+
+(* std of observation residual for scale of noise initialisation *)
+let compute_noise_init ~z ~c ~x =
+  let dim = (Arr.shape z).(-1) in
+  let pred = Mat.(reshape z [| -1; dim |] *@ transpose c) in
+  let diff = Mat.(reshape x [| -1; (Arr.shape x).(2) |] - pred) in
+  AA.var ~axis:0 ~keep_dims:true diff
+
+
 (* Compute info needed for initialising parameters *)
 let param_init_info ~dim x =
   (* use a subset of x for computation *)
-  let ids = List.range 0 AA.(shape x).(0) |> List.permute |> List.sub ~pos:0 ~len:500 in
+  let ids = List.range 0 AA.(shape x).(0) |> List.permute |> List.sub ~pos:0 ~len:5000 in
   let x = AA.get_fancy [ L ids; R []; R [] ] x in
   let pcs = pcs ~dim x in
   let z = z_inferred ~pcs x in
-  (* [ 5000 x (tmax-1) x dim ] *)
   let z_0 = z_0 z
   and z_1 = z_1 z in
   let z_0_ = AA.reshape z_0 [| -1; dim |] in
   let z_1_ = AA.reshape z_1 [| -1; dim |] in
-  (* regression to fit state transition matrix *)
-  let a =
-    (* [ dim x (5000 x tmax-1) ]*)
-    let z_0_ = AA.transpose z_0_
-    and z_1_ = AA.transpose z_1_ in
-    let to_inv = Mat.(z_0_ *@ transpose z_0_) in
-    Mat.(z_1_ *@ transpose z_0_ *@ svd_inv to_inv)
+  (* [ 5000 x (tmax-1) x dim ] *)
+  let a_init =
+    if a_init
+    then (
+      let a = compute_a ~z_0:z_0_ ~z_1:z_1_ in
+      Some a)
+    else None
   in
-  (* std of state residual for scale of b matrix initialisation *)
-  let b =
-    let a_z0 = Mat.(z_0_ *@ transpose a) in
-    (* [ 5000 x (tmax-1) x dim ] *)
-    let diff = AA.(reshape (z_1_ - a_z0) (shape z_0_)) in
-    AA.std ~axis:0 ~keep_dims:true diff
+  let b_init =
+    if b_init
+    then (
+      let b =
+        let a =
+          match a_init with
+          | None -> compute_a ~z_0:z_0_ ~z_1:z_1_
+          | Some a -> a
+        in
+        compute_b ~z_0:z_0_ ~z_1:z_1_ ~a
+      in
+      Some b)
+    else None
   in
-  (* std of observation residual for scale of noise initialisation *)
   let noise_init =
-    let pred = Mat.(reshape z [| -1; dim |] *@ transpose pcs) in
-    let diff = Mat.(reshape x [| -1; (Arr.shape x).(2) |] - pred) in
-    AA.var ~axis:0 ~keep_dims:true diff
+    if noise_init
+    then (
+      let noise_init = compute_noise_init ~z ~c:pcs ~x in
+      Some noise_init)
+    else None
   in
-  { a_init = a; b_init = b; c_init = c_init pcs; noise_init }
+  { a_init; b_init; c_init = c_init pcs; noise_init }
 
 
 (* Load + preprocess only on rank 0 *)
@@ -162,11 +200,6 @@ let tmax, init_info, data_train, train_batch_size, data_save_results, data_test 
     in
     let data_test = truncate data_test mini_batch in
     let init_info = param_init_info ~dim:n data_train_npy in
-    let noise_scale = init_info.noise_init |> Arr.mean' in
-    let b_scale = init_info.b_init |> Arr.mean' in
-    Arr.save_npy ~out:(in_dir "a_init") init_info.a_init;
-    print [%message (b_scale : float)];
-    print [%message (noise_scale : float)];
     print [%message "Finished computing param init info"];
     tmax, init_info, data_train, train_batch_size, data_save_results, data_test)
 
@@ -249,25 +282,36 @@ let init_prms () =
     let n = setup.n
     and m = setup.m in
     (* pin prior and prior_recog *)
-    let prior = U.P.map (U.init ~spatial_std:1.0 ~m ()) ~f:Prms.pin in
+    let prior = U.init ~spatial_std:1.0 ~m () in
+    let prior = if pin_prior then U.P.map prior ~f:Prms.pin else prior in
     let prior_recog = prior in
+    let dynamics = D.init ~dt_over_tau:Float.(dt / tau) ~alpha:0.5 ~beta:0.5 ~n ~m () in
     let dynamics =
       D.P.
-        { a = Prms.create (AD.pack_arr init_info.a_init)
+        { a =
+            (match init_info.a_init with
+             | None -> dynamics.a
+             | Some a -> Prms.create (AD.pack_arr a))
         ; b =
-            Some
-              (Prms.create
-                 (AD.pack_arr
-                    Mat.(Float.(1. / of_int n) $* init_info.b_init * gaussian m n)))
+            (match init_info.b_init with
+             | None -> dynamics.b
+             | Some b ->
+               Some
+                 (Prms.create
+                    (AD.pack_arr Mat.(Float.(1. / of_int n) $* b * gaussian m n))))
         }
     in
     let likelihood =
-      L.P.
-        { c = Prms.create (AD.pack_arr init_info.c_init)
-        ; variances = Prms.create (AD.pack_arr init_info.noise_init)
-        ; c_mask = None
-        ; bias = Prms.create (AD.Mat.create 1 n_output 0.)
-        }
+      let likelihood_tmp =
+        let tmp = L.init ~scale:1. ~sigma2:1. ~n ~n_output () in
+        { tmp with c = Prms.create (AD.pack_arr init_info.c_init) }
+      in
+      { likelihood_tmp with
+        variances =
+          (match init_info.noise_init with
+           | None -> likelihood_tmp.variances
+           | Some noise_init -> Prms.create (AD.pack_arr noise_init))
+      }
     in
     Model.init ~prior ~prior_recog ~dynamics ~likelihood ())
 
@@ -279,7 +323,7 @@ let save_results prefix prms data =
     Model.P.save_txt ~prefix prms);
   let prms = Model.P.value prms in
   (* sample from model parameters *)
-  List.iter (List.range 0 n_samples) ~f:(fun i ->
+  List.iter (List.range 0 n_trials_save) ~f:(fun i ->
     if Int.(i % C.n_nodes = C.rank)
     then (
       let data_gen = Model.sample_generative ~pre:true prms in
@@ -288,7 +332,6 @@ let save_results prefix prms data =
         AA.reshape a [| setup.n_steps; -1 |]
         |> AA.save_txt ~out:(file (Printf.sprintf "generated_%s_%i" label i))
       in
-      print [%message "starting saving data_gen "];
       process_gen "u" (Option.value_exn data_gen.u);
       process_gen "z" (Option.value_exn data_gen.z);
       process_gen "o" data_gen.o));
