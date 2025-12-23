@@ -18,6 +18,7 @@ let data_path = Option.value_exn (Cmdargs.get_string "-data")
    ---- Training Arguments -----
    ----------------------------------------- *)
 let n_trials_save = 100
+let n_samples = 100
 let max_iter = 10000
 
 (* state dim *)
@@ -57,7 +58,7 @@ let pack_data x =
 type init_info =
   { c_init : AA.arr
   ; a_init : AA.arr
-  ; b_init_scale : float
+  ; b_init : AA.arr
   ; noise_init : AA.arr
   }
 
@@ -102,7 +103,7 @@ let z_1 z = AA.get_slice [ []; [ 1; -1 ]; [] ] z
 (* Compute info needed for initialising parameters *)
 let param_init_info ~dim x =
   (* use a subset of x for computation *)
-  let ids = List.range 0 AA.(shape x).(0) |> List.permute |> List.sub ~pos:0 ~len:2 in
+  let ids = List.range 0 AA.(shape x).(0) |> List.permute |> List.sub ~pos:0 ~len:5000 in
   let x = AA.get_fancy [ L ids; R []; R [] ] x in
   let pcs = pcs ~dim x in
   let z = z_inferred ~pcs x in
@@ -123,8 +124,8 @@ let param_init_info ~dim x =
   let b =
     let a_z0 = Mat.(z_0_ *@ transpose a) in
     (* [ 5000 x (tmax-1) x dim ] *)
-    let diff = AA.(reshape (z_1_ - a_z0) (shape z_0)) in
-    AA.std' diff
+    let diff = AA.(reshape (z_1_ - a_z0) (shape z_0_)) in
+    AA.std ~axis:0 ~keep_dims:true diff
   in
   (* std of observation residual for scale of noise initialisation *)
   let noise_init =
@@ -132,7 +133,7 @@ let param_init_info ~dim x =
     let diff = Mat.(reshape x [| -1; (Arr.shape x).(2) |] - pred) in
     AA.var ~axis:0 ~keep_dims:true diff
   in
-  { a_init = a; b_init_scale = b; c_init = c_init pcs; noise_init }
+  { a_init = a; b_init = b; c_init = c_init pcs; noise_init }
 
 
 (* Load + preprocess only on rank 0 *)
@@ -157,6 +158,11 @@ let tmax, init_info, data_train, train_batch_size, data_save_results, data_test 
     in
     let data_test = truncate data_test mini_batch in
     let init_info = param_init_info ~dim:n data_train_npy in
+    let noise_scale = init_info.noise_init |> Arr.mean' in
+    let b_scale = init_info.b_init |> Arr.mean' in
+    Arr.save_npy ~out:(in_dir "a_init") init_info.a_init;
+    print [%message (b_scale : float)];
+    print [%message (noise_scale : float)];
     print [%message "Finished computing param init info"];
     tmax, init_info, data_train, train_batch_size, data_save_results, data_test)
 
@@ -239,7 +245,6 @@ let init_prms () =
     let n = setup.n
     and m = setup.m in
     (* pin prior and prior_recog *)
-    (* let prior = U.init ~spatial_std:1.0 ~m () in *)
     let prior = U.P.map (U.init ~spatial_std:1.0 ~m ()) ~f:Prms.pin in
     let prior_recog = prior in
     let dynamics =
@@ -248,15 +253,17 @@ let init_prms () =
         ; b =
             Some
               (Prms.create
-                 (AD.Mat.gaussian ~sigma:Float.(init_info.b_init_scale / of_int n) m n))
+                 (AD.pack_arr
+                    Mat.(Float.(1. / of_int n) $* init_info.b_init * gaussian m n)))
         }
     in
     let likelihood =
-      let tmp = L.init ~scale:1. ~sigma2:1. ~n ~n_output () in
-      { tmp with
-        c = Prms.create (AD.pack_arr init_info.c_init)
-      ; variances = Prms.create (AD.pack_arr init_info.noise_init)
-      }
+      L.P.
+        { c = Prms.create (AD.pack_arr init_info.c_init)
+        ; variances = Prms.create (AD.pack_arr init_info.noise_init)
+        ; c_mask = None
+        ; bias = Prms.create (AD.Mat.create 1 n_output 0.)
+        }
     in
     Model.init ~prior ~prior_recog ~dynamics ~likelihood ())
 
@@ -285,7 +292,7 @@ let save_results prefix prms data =
     then (
       let mu = Model.posterior_mean ~prms dat_trial in
       AA.save_txt ~out:(file (Printf.sprintf "posterior_u_%i" i)) (AD.unpack_arr mu);
-      let us, zs, os = Model.predictions ~n_samples:100 ~prms mu in
+      let us, zs, os = Model.predictions ~n_samples ~prms mu in
       let process label a =
         let a = AD.unpack_arr a in
         AA.(mean ~axis:2 a @|| var ~axis:2 a)
@@ -318,7 +325,7 @@ let rec iter ~k state =
   then (
     let test_loss =
       Model.elbo_no_gradient
-        ~n_samples:100
+        ~n_samples
         ~conv_threshold:1E-4
         (Model.P.value prms)
         data_test
@@ -333,13 +340,7 @@ let rec iter ~k state =
           (of_array [| Float.of_int k; test_loss |] [| 1; 2 |]));
       save_results (in_dir "final") prms data_save_results));
   let loss, g =
-    Model.elbo_gradient
-      ~n_samples:100
-      ~mini_batch
-      ~conv_threshold:1E-4
-      ~reg
-      prms
-      data_train
+    Model.elbo_gradient ~n_samples ~mini_batch ~conv_threshold:1E-4 ~reg prms data_train
   in
   (if C.first
    then
@@ -378,7 +379,7 @@ let _ =
     C.broadcast' (fun () -> Misc.read_bin (in_dir "final.params.bin") |> Model.P.value)
   in
   let test_loss =
-    Model.elbo_no_gradient ~n_samples:100 ~conv_threshold:1E-4 prms_final data_test
+    Model.elbo_no_gradient ~n_samples ~conv_threshold:1E-4 prms_final data_test
   in
   if C.first
   then
