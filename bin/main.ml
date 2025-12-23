@@ -279,17 +279,19 @@ let save_results prefix prms data =
     Model.P.save_txt ~prefix prms);
   let prms = Model.P.value prms in
   (* sample from model parameters *)
-  C.root_perform (fun () ->
-    let data_gen = Model.sample_generative ~pre:true prms in
-    let process_gen label a =
-      let a = AD.unpack_arr a in
-      AA.reshape a [| setup.n_steps; -1 |]
-      |> AA.save_txt ~out:(file (Printf.sprintf "generated_%s" label))
-    in
-    print [%message "starting saving data_gen "];
-    process_gen "u" (Option.value_exn data_gen.u);
-    process_gen "z" (Option.value_exn data_gen.z);
-    process_gen "o" data_gen.o);
+  List.iter (List.range 0 n_samples) ~f:(fun i ->
+    if Int.(i % C.n_nodes = C.rank)
+    then (
+      let data_gen = Model.sample_generative ~pre:true prms in
+      let process_gen label a =
+        let a = AD.unpack_arr a in
+        AA.reshape a [| setup.n_steps; -1 |]
+        |> AA.save_txt ~out:(file (Printf.sprintf "generated_%s_%i" label i))
+      in
+      print [%message "starting saving data_gen "];
+      process_gen "u" (Option.value_exn data_gen.u);
+      process_gen "z" (Option.value_exn data_gen.z);
+      process_gen "o" data_gen.o));
   (* sample from model using inferred u *)
   Array.iteri data ~f:(fun i dat_trial ->
     if Int.(i % C.n_nodes = C.rank)
