@@ -37,6 +37,7 @@ let pin_prior = Option.value (Cmdargs.get_bool "-pin_prior") ~default:false
 let lr = Option.value (Cmdargs.get_float "-lr") ~default:0.001
 let decay_rate = Option.value (Cmdargs.get_float "-decay_rate") ~default:1.
 let mini_batch = Option.value (Cmdargs.get_int "-mini_batch") ~default:32
+let early_stopping = Option.value (Cmdargs.get_bool "-early_stopping") ~default:false
 
 (* -----------------------------------------
    -- Data Read In ---
@@ -375,46 +376,108 @@ let config _k =
 
 let t0 = Unix.gettimeofday ()
 
-let rec iter ~k state =
-  let prms = Model.broadcast_prms (Optimizer.v state) in
-  if Int.(k % 100 = 0)
-  then (
-    let test_loss =
-      Model.elbo_no_gradient
-        ~n_samples
-        ~conv_threshold:1E-4
-        (Model.P.value prms)
-        data_test
-    in
-    if C.first
+(* let rec iter ~stop ~k state =
+  if stop
+  then Optimizer.v state
+  else (
+    let prms = Model.broadcast_prms (Optimizer.v state) in
+    if Int.(k % 100 = 0)
     then (
-      Optimizer.save ~out:(in_dir "state.bin") state;
-      AA.(
-        save_txt
-          ~append:true
-          ~out:(in_dir "test_loss")
-          (of_array [| Float.of_int k; test_loss |] [| 1; 2 |]));
-      save_results (in_dir "final") prms data_save_results));
-  let loss, g =
-    Model.elbo_gradient ~n_samples ~mini_batch ~conv_threshold:1E-4 ~reg prms data_train
-  in
-  (if C.first
-   then
-     AA.(
-       save_txt
-         ~append:true
-         ~out:(in_dir "loss")
-         (of_array [| Float.of_int k; loss |] [| 1; 2 |])));
-  let state =
-    match g with
-    | None -> state
-    | Some g -> Optimizer.step ~config:(config k) ~info:g state
-  in
-  let t1 = Unix.gettimeofday () in
-  let time_elapsed = t1 -. t0 in
-  if Int.(k % 10 = 0)
-  then print [%message (k : int) (time_elapsed : float) (loss : float)];
-  if k < max_iter then iter ~k:(k + 1) state else Optimizer.v state
+      let test_loss =
+        Model.elbo_no_gradient
+          ~n_samples
+          ~conv_threshold:1E-4
+          (Model.P.value prms)
+          data_test
+      in
+      if C.first
+      then (
+        Optimizer.save ~out:(in_dir "state.bin") state;
+        AA.(
+          save_txt
+            ~append:true
+            ~out:(in_dir "test_loss")
+            (of_array [| Float.of_int k; test_loss |] [| 1; 2 |]));
+        save_results (in_dir "final") prms data_save_results));
+    let loss, g =
+      Model.elbo_gradient ~n_samples ~mini_batch ~conv_threshold:1E-4 ~reg prms data_train
+    in
+    (if C.first
+     then
+       AA.(
+         save_txt
+           ~append:true
+           ~out:(in_dir "loss")
+           (of_array [| Float.of_int k; loss |] [| 1; 2 |])));
+    let state =
+      match g with
+      | None -> state
+      | Some g -> Optimizer.step ~config:(config k) ~info:g state
+    in
+    let t1 = Unix.gettimeofday () in
+    let time_elapsed = t1 -. t0 in
+    if Int.(k % 10 = 0)
+    then print [%message (k : int) (time_elapsed : float) (loss : float)];
+    if k < max_iter then iter ~stop ~k:(k + 1) state else Optimizer.v state) *)
+
+let rec iter ~stop ~k ~prev_test_loss state =
+  if stop
+  then Optimizer.v state
+  else (
+    let prms = Model.broadcast_prms (Optimizer.v state) in
+    (* Evaluate test loss every 100 iterations *)
+    let stop, prev_test_loss =
+      if Int.(k % 100 = 0)
+      then (
+        let test_loss =
+          Model.elbo_no_gradient
+            ~n_samples
+            ~conv_threshold:1E-4
+            (Model.P.value prms)
+            data_test
+        in
+        (* Stop if test loss increased *)
+        let stop =
+          if early_stopping
+          then (
+            match prev_test_loss with
+            | None -> false
+            | Some prev -> Float.(test_loss > prev))
+          else false
+        in
+        if C.first
+        then (
+          Optimizer.save ~out:(in_dir "state.bin") state;
+          AA.(
+            save_txt
+              ~append:true
+              ~out:(in_dir "test_loss")
+              (of_array [| Float.of_int k; test_loss |] [| 1; 2 |]));
+          save_results (in_dir "final") prms data_save_results);
+        stop, Some test_loss)
+      else stop, prev_test_loss
+    in
+    let loss, g =
+      Model.elbo_gradient ~n_samples ~mini_batch ~conv_threshold:1E-4 ~reg prms data_train
+    in
+    (if C.first
+     then
+       AA.(
+         save_txt
+           ~append:true
+           ~out:(in_dir "loss")
+           (of_array [| Float.of_int k; loss |] [| 1; 2 |])));
+    let state =
+      match g with
+      | None -> state
+      | Some g -> Optimizer.step ~config:(config k) ~info:g state
+    in
+    let t1 = Unix.gettimeofday () in
+    let time_elapsed = t1 -. t0 in
+    if Int.(k % 10 = 0)
+    then print [%message (k : int) (time_elapsed : float) (loss : float)];
+    let stop = Int.(k >= max_iter) || stop in
+    iter ~stop ~k:(k + 1) ~prev_test_loss state)
 
 
 let final_prms =
@@ -423,7 +486,7 @@ let final_prms =
     | Some file -> Optimizer.load file
     | None -> Optimizer.init (init_prms ())
   in
-  iter ~k:0 state
+  iter ~stop:false ~k:0 ~prev_test_loss:None state
 
 
 let _ = save_results (in_dir "final") final_prms data_save_results
