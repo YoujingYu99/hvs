@@ -158,7 +158,6 @@ let param_init_info ~dim x =
     if a_init
     then (
       let a = compute_a ~z_0:z_0_ ~z_1:z_1_ in
-      Mat.save_txt a ~out:(in_dir "a_init");
       Some a)
     else None
   in
@@ -324,11 +323,16 @@ let init_prms () =
     Model.init ~prior ~prior_recog ~dynamics ~likelihood ())
 
 
-let save_results prefix prms data =
-  let file s = prefix ^ "." ^ s in
+let file ~prefix s = prefix ^ "." ^ s
+
+let save_params ~prefix prms =
   C.root_perform (fun () ->
-    Misc.save_bin ~out:(file "params.bin") prms;
-    Model.P.save_txt ~prefix prms);
+    Misc.save_bin ~out:(file ~prefix "params.bin") prms;
+    Model.P.save_txt ~prefix prms)
+
+
+let save_results prefix prms data =
+  save_params ~prefix prms;
   let prms = Model.P.value prms in
   (* sample from model parameters *)
   List.iter (List.range 0 n_trials_save) ~f:(fun i ->
@@ -338,7 +342,7 @@ let save_results prefix prms data =
       let process_gen label a =
         let a = AD.unpack_arr a in
         AA.reshape a [| setup.n_steps; -1 |]
-        |> AA.save_txt ~out:(file (Printf.sprintf "generated_%s_%i" label i))
+        |> AA.save_txt ~out:(file ~prefix (Printf.sprintf "generated_%s_%i" label i))
       in
       process_gen "u" (Option.value_exn data_gen.u);
       process_gen "z" (Option.value_exn data_gen.z);
@@ -348,13 +352,15 @@ let save_results prefix prms data =
     if Int.(i % C.n_nodes = C.rank)
     then (
       let mu = Model.posterior_mean ~prms dat_trial in
-      AA.save_txt ~out:(file (Printf.sprintf "posterior_u_%i" i)) (AD.unpack_arr mu);
+      AA.save_txt
+        ~out:(file ~prefix (Printf.sprintf "posterior_u_%i" i))
+        (AD.unpack_arr mu);
       let us, zs, os = Model.predictions ~n_samples ~prms mu in
       let process label a =
         let a = AD.unpack_arr a in
         AA.(mean ~axis:2 a @|| var ~axis:2 a)
         |> (fun z -> AA.reshape z [| setup.n_steps; -1 |])
-        |> AA.save_txt ~out:(file (Printf.sprintf "predicted_%s_%i" label i))
+        |> AA.save_txt ~out:(file ~prefix (Printf.sprintf "predicted_%s_%i" label i))
       in
       process "u" us;
       process "z" zs;
@@ -374,13 +380,17 @@ let config _k =
     }
 
 
-let t0 = Unix.gettimeofday ()
+(* Converts a boolean to int, sums across all ranks, returns true if any rank had true *)
+let mpi_or (x : bool) : bool =
+  let xi = if x then 1 else 0 in
+  let total = C.reduce_sum_int xi in
+  total > 0
 
-(* let rec iter ~stop ~k state =
-  if stop
-  then Optimizer.v state
-  else (
-    let prms = Model.broadcast_prms (Optimizer.v state) in
+
+let rec iter ~k ~prev_test_loss state =
+  let prms = Model.broadcast_prms (Optimizer.v state) in
+  (* Evaluate test loss every 100 iterations *)
+  let stop_test, prev_test_loss =
     if Int.(k % 100 = 0)
     then (
       let test_loss =
@@ -390,6 +400,14 @@ let t0 = Unix.gettimeofday ()
           (Model.P.value prms)
           data_test
       in
+      (* Stop if test loss increased *)
+      let stop_local =
+        early_stopping
+        &&
+        match prev_test_loss with
+        | None -> false
+        | Some prev -> Float.(test_loss > prev)
+      in
       if C.first
       then (
         Optimizer.save ~out:(in_dir "state.bin") state;
@@ -398,65 +416,14 @@ let t0 = Unix.gettimeofday ()
             ~append:true
             ~out:(in_dir "test_loss")
             (of_array [| Float.of_int k; test_loss |] [| 1; 2 |]));
-        save_results (in_dir "final") prms data_save_results));
-    let loss, g =
-      Model.elbo_gradient ~n_samples ~mini_batch ~conv_threshold:1E-4 ~reg prms data_train
-    in
-    (if C.first
-     then
-       AA.(
-         save_txt
-           ~append:true
-           ~out:(in_dir "loss")
-           (of_array [| Float.of_int k; loss |] [| 1; 2 |])));
-    let state =
-      match g with
-      | None -> state
-      | Some g -> Optimizer.step ~config:(config k) ~info:g state
-    in
-    let t1 = Unix.gettimeofday () in
-    let time_elapsed = t1 -. t0 in
-    if Int.(k % 10 = 0)
-    then print [%message (k : int) (time_elapsed : float) (loss : float)];
-    if k < max_iter then iter ~stop ~k:(k + 1) state else Optimizer.v state) *)
-
-let rec iter ~stop ~k ~prev_test_loss state =
+        save_results (in_dir "final") prms data_save_results);
+      stop_local, Some test_loss)
+    else false, prev_test_loss
+  in
+  let stop = stop_test || Int.(k >= max_iter) |> mpi_or in
   if stop
   then Optimizer.v state
   else (
-    let prms = Model.broadcast_prms (Optimizer.v state) in
-    (* Evaluate test loss every 100 iterations *)
-    let stop, prev_test_loss =
-      if Int.(k % 100 = 0)
-      then (
-        let test_loss =
-          Model.elbo_no_gradient
-            ~n_samples
-            ~conv_threshold:1E-4
-            (Model.P.value prms)
-            data_test
-        in
-        (* Stop if test loss increased *)
-        let stop =
-          if early_stopping
-          then (
-            match prev_test_loss with
-            | None -> false
-            | Some prev -> Float.(test_loss > prev))
-          else false
-        in
-        if C.first
-        then (
-          Optimizer.save ~out:(in_dir "state.bin") state;
-          AA.(
-            save_txt
-              ~append:true
-              ~out:(in_dir "test_loss")
-              (of_array [| Float.of_int k; test_loss |] [| 1; 2 |]));
-          save_results (in_dir "final") prms data_save_results);
-        stop, Some test_loss)
-      else stop, prev_test_loss
-    in
     let loss, g =
       Model.elbo_gradient ~n_samples ~mini_batch ~conv_threshold:1E-4 ~reg prms data_train
     in
@@ -472,12 +439,8 @@ let rec iter ~stop ~k ~prev_test_loss state =
       | None -> state
       | Some g -> Optimizer.step ~config:(config k) ~info:g state
     in
-    let t1 = Unix.gettimeofday () in
-    let time_elapsed = t1 -. t0 in
-    if Int.(k % 10 = 0)
-    then print [%message (k : int) (time_elapsed : float) (loss : float)];
-    let stop = Int.(k >= max_iter) || stop in
-    iter ~stop ~k:(k + 1) ~prev_test_loss state)
+    if Int.(k % 10 = 0) then print [%message (k : int) (loss : float)];
+    iter ~k:(k + 1) ~prev_test_loss state)
 
 
 let final_prms =
@@ -486,13 +449,13 @@ let final_prms =
     | Some file -> Optimizer.load file
     | None -> Optimizer.init (init_prms ())
   in
-  iter ~stop:false ~k:0 ~prev_test_loss:None state
+  save_params ~prefix:"init" (Optimizer.v state);
+  iter ~k:0 ~prev_test_loss:None state
 
 
 let _ = save_results (in_dir "final") final_prms data_save_results
 
-(* compute validation loss from available models *)
-
+(* Compute final validation loss from available models *)
 let _ =
   let (prms_final : Model.P.t') =
     C.broadcast' (fun () -> Misc.read_bin (in_dir "final.params.bin") |> Model.P.value)
