@@ -36,7 +36,7 @@ let pin_prior = Option.value (Cmdargs.get_bool "-pin_prior") ~default:false
 (* learning rate *)
 let lr = Option.value (Cmdargs.get_float "-lr") ~default:0.001
 let decay_rate = Option.value (Cmdargs.get_float "-decay_rate") ~default:1.
-let mini_batch = 32
+let mini_batch = Option.value (Cmdargs.get_int "-mini_batch") ~default:32
 
 (* -----------------------------------------
    -- Data Read In ---
@@ -129,9 +129,15 @@ let compute_b ~z_0 ~z_1 ~a =
 
 (* std of observation residual for scale of noise initialisation *)
 let compute_noise_init ~z ~c ~x =
-  let dim = (Arr.shape z).(-1) in
-  let pred = Mat.(reshape z [| -1; dim |] *@ transpose c) in
-  let diff = Mat.(reshape x [| -1; (Arr.shape x).(2) |] - pred) in
+  let dim = (Arr.shape z).(2) in
+  let pred =
+    let z_tmp = Arr.(reshape z [| -1; dim |]) in
+    Mat.(z_tmp *@ transpose c)
+  in
+  let diff =
+    let x_tmp = Arr.reshape x [| -1; (Arr.shape x).(2) |] in
+    Mat.(x_tmp - pred)
+  in
   AA.var ~axis:0 ~keep_dims:true diff
 
 
@@ -151,6 +157,7 @@ let param_init_info ~dim x =
     if a_init
     then (
       let a = compute_a ~z_0:z_0_ ~z_1:z_1_ in
+      Mat.save_txt a ~out:(in_dir "a_init");
       Some a)
     else None
   in
