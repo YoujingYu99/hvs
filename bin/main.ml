@@ -37,7 +37,7 @@ let pin_prior = Option.value (Cmdargs.get_bool "-pin_prior") ~default:false
 let lr = Option.value (Cmdargs.get_float "-lr") ~default:0.001
 let decay_rate = Option.value (Cmdargs.get_float "-decay_rate") ~default:1.
 let mini_batch = Option.value (Cmdargs.get_int "-mini_batch") ~default:32
-let early_stopping = Option.value (Cmdargs.get_bool "-early_stopping") ~default:false
+let use_early_stopping = Option.value (Cmdargs.get_bool "-early_stopping") ~default:false
 
 (* -----------------------------------------
    -- Data Read In ---
@@ -388,10 +388,27 @@ let mpi_or (x : bool) : bool =
   total > 0
 
 
-let rec iter ~k ~prev_test_loss state =
+type early_stop_state =
+  { best_loss : float option
+  ; wait : int
+  ; patience : int
+  }
+
+let check_early_stop state current_loss =
+  match state.best_loss with
+  | None -> false, Some { state with best_loss = Some current_loss; wait = 0 }
+  | Some best ->
+    if Float.(current_loss < best)
+    then false, Some { state with best_loss = Some current_loss; wait = 0 }
+    else (
+      let wait = state.wait + 1 in
+      wait > state.patience, Some { state with wait })
+
+
+let rec iter ~k ~state_early_stop state =
   let prms = Model.broadcast_prms (Optimizer.v state) in
   (* Evaluate test loss every 100 iterations *)
-  let stop_test, prev_test_loss =
+  let stop_test, state_early_stop =
     if Int.(k % 100 = 0)
     then (
       let test_loss =
@@ -400,14 +417,6 @@ let rec iter ~k ~prev_test_loss state =
           ~conv_threshold:1E-4
           (Model.P.value prms)
           data_test
-      in
-      (* Stop if test loss increased *)
-      let stop_local =
-        early_stopping
-        &&
-        match prev_test_loss with
-        | None -> false
-        | Some prev -> Float.(test_loss > prev)
       in
       if C.first
       then (
@@ -418,10 +427,12 @@ let rec iter ~k ~prev_test_loss state =
             ~out:(in_dir "test_loss")
             (of_array [| Float.of_int k; test_loss |] [| 1; 2 |]));
         save_results ~prefix:(in_dir "final") prms data_save_results);
-      stop_local, Some test_loss)
-    else false, prev_test_loss
+      match state_early_stop with
+      | Some state_early_stop -> check_early_stop state_early_stop test_loss
+      | None -> false, None)
+    else false, state_early_stop
   in
-  let stop = stop_test || Int.(k >= max_iter) |> mpi_or in
+  let stop = (stop_test || Int.(k >= max_iter)) |> mpi_or in
   if stop
   then Optimizer.v state
   else (
@@ -441,7 +452,7 @@ let rec iter ~k ~prev_test_loss state =
       | Some g -> Optimizer.step ~config:(config k) ~info:g state
     in
     if Int.(k % 100 = 0) then print [%message (k : int) (loss : float)];
-    iter ~k:(k + 1) ~prev_test_loss state)
+    iter ~k:(k + 1) ~state_early_stop state)
 
 
 let final_prms =
@@ -451,7 +462,10 @@ let final_prms =
     | None -> Optimizer.init (init_prms ())
   in
   save_params ~prefix:(in_dir "init") (Optimizer.v state);
-  iter ~k:0 ~prev_test_loss:None state
+  let state_early_stop =
+    if use_early_stopping then Some { best_loss = None; wait = 0; patience = 5 } else None
+  in
+  iter ~k:0 ~state_early_stop state
 
 
 let _ = save_results ~prefix:(in_dir "final") final_prms data_save_results
