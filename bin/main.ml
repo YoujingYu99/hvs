@@ -331,7 +331,7 @@ let save_params ~prefix prms =
     Model.P.save_txt ~prefix prms)
 
 
-let save_results prefix prms data =
+let save_results ~prefix prms data =
   save_params ~prefix prms;
   let prms = Model.P.value prms in
   (* sample from model parameters *)
@@ -384,6 +384,7 @@ let config _k =
 let mpi_or (x : bool) : bool =
   let xi = if x then 1 else 0 in
   let total = C.reduce_sum_int xi in
+  let total = C.broadcast total in
   total > 0
 
 
@@ -416,7 +417,7 @@ let rec iter ~k ~prev_test_loss state =
             ~append:true
             ~out:(in_dir "test_loss")
             (of_array [| Float.of_int k; test_loss |] [| 1; 2 |]));
-        save_results (in_dir "final") prms data_save_results);
+        save_results ~prefix:(in_dir "final") prms data_save_results);
       stop_local, Some test_loss)
     else false, prev_test_loss
   in
@@ -439,7 +440,7 @@ let rec iter ~k ~prev_test_loss state =
       | None -> state
       | Some g -> Optimizer.step ~config:(config k) ~info:g state
     in
-    if Int.(k % 10 = 0) then print [%message (k : int) (loss : float)];
+    if Int.(k % 100 = 0) then print [%message (k : int) (loss : float)];
     iter ~k:(k + 1) ~prev_test_loss state)
 
 
@@ -449,11 +450,11 @@ let final_prms =
     | Some file -> Optimizer.load file
     | None -> Optimizer.init (init_prms ())
   in
-  save_params ~prefix:"init" (Optimizer.v state);
+  save_params ~prefix:(in_dir "init") (Optimizer.v state);
   iter ~k:0 ~prev_test_loss:None state
 
 
-let _ = save_results (in_dir "final") final_prms data_save_results
+let _ = save_results ~prefix:(in_dir "final") final_prms data_save_results
 
 (* Compute final validation loss from available models *)
 let _ =
