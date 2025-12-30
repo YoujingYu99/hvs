@@ -226,7 +226,7 @@ module Make_model (P : sig
     val n_beg : int Option.t
   end) =
 struct
-  module U = Prior.Gaussian (struct
+  module U = Prior.Student (struct
       let n_beg = P.n_beg
     end)
 
@@ -291,7 +291,7 @@ let init_prms () =
     (* pin prior and prior_recog *)
     let prior = U.init ~spatial_std:1.0 ~m () in
     let prior = if pin_prior then U.P.map prior ~f:Prms.pin else prior in
-    let prior_recog = prior in
+    let prior_recog = UR.init ~spatial_std:1.0 ~m () in
     let dynamics = D.init ~dt_over_tau:Float.(dt / tau) ~alpha:0.5 ~beta:0.5 ~n ~m () in
     let dynamics =
       D.P.
@@ -381,12 +381,11 @@ let config _k =
 
 
 (* Converts a boolean to int, sums across all ranks, returns true if any rank had true *)
-let mpi_or (x : bool) : bool =
+(* let mpi_or (x : bool) : bool =
   let xi = if x then 1 else 0 in
   let total = C.reduce_sum_int xi in
   let total = C.broadcast total in
-  total > 0
-
+  total > 0 *)
 
 type early_stop_state =
   { best_loss : float option
@@ -432,7 +431,8 @@ let rec iter ~k ~state_early_stop state =
       | None -> false, None)
     else false, state_early_stop
   in
-  let stop = (stop_test || Int.(k >= max_iter)) |> mpi_or in
+  let local_stop = if C.rank = 0 then stop_test || Int.(k >= max_iter) else false in
+  let stop = C.broadcast local_stop in
   if stop
   then Optimizer.v state
   else (
