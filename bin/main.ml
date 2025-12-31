@@ -8,7 +8,7 @@ module Arr = Owl.Dense.Ndarray.S
 
 let _ =
   Random.init 1998;
-  Owl_stats_prng.init (Random.int 100000)
+  Owl_stats_prng.init (1998 + C.rank)
 
 
 let in_dir = Cmdargs.in_dir "-results"
@@ -38,6 +38,7 @@ let lr = Option.value (Cmdargs.get_float "-lr") ~default:0.001
 let decay_rate = Option.value (Cmdargs.get_float "-decay_rate") ~default:1.
 let mini_batch = Option.value (Cmdargs.get_int "-mini_batch") ~default:32
 let use_early_stopping = Option.value (Cmdargs.get_bool "-early_stopping") ~default:false
+let regularise = Option.value (Cmdargs.get_bool "-regularise") ~default:false
 
 (* -----------------------------------------
    -- Data Read In ---
@@ -85,7 +86,7 @@ let pcs ~dim x =
 
 
 (* Use PCA for initialising the C matrix. *)
-let c_init pcs =
+let init_c pcs =
   let c = AA.(pcs / l2norm ~axis:1 pcs) in
   let dim = (AA.shape pcs).(1) in
   let q, _ = AA.Linalg.qr (AA.gaussian [| dim; dim |]) in
@@ -154,7 +155,7 @@ let param_init_info ~dim x =
   let z_0_ = AA.reshape z_0 [| -1; dim |] in
   let z_1_ = AA.reshape z_1 [| -1; dim |] in
   (* [ 5000 x (tmax-1) x dim ] *)
-  let a_init =
+  let a =
     if a_init
     then (
       let a = compute_a ~z_0:z_0_ ~z_1:z_1_ in
@@ -166,7 +167,7 @@ let param_init_info ~dim x =
     then (
       let b =
         let a =
-          match a_init with
+          match a with
           | None -> compute_a ~z_0:z_0_ ~z_1:z_1_
           | Some a -> a
         in
@@ -182,7 +183,7 @@ let param_init_info ~dim x =
       Some noise_init)
     else None
   in
-  { a_init; b_init; c_init = c_init pcs; noise_init }
+  { a_init = a; b_init; c_init = init_c pcs; noise_init }
 
 
 (* Load + preprocess only on rank 0 *)
@@ -284,6 +285,8 @@ let reg ~(prms : Model.P.t') =
     AD.Maths.(a_reg + b_reg)
 
 
+let reg_arg = if regularise then Some reg else None
+
 let init_prms () =
   C.broadcast' (fun () ->
     let n = setup.n
@@ -338,15 +341,16 @@ let save_results ~prefix prms data =
   List.iter (List.range 0 n_trials_save) ~f:(fun i ->
     if Int.(i % C.n_nodes = C.rank)
     then (
-      let data_gen = Model.sample_generative ~pre:true prms in
+      let u, z, o, o_noisy = Model.sample_generative ~noisy:true prms in
       let process_gen label a =
         let a = AD.unpack_arr a in
         AA.reshape a [| setup.n_steps; -1 |]
         |> AA.save_txt ~out:(file ~prefix (Printf.sprintf "generated_%s_%i" label i))
       in
-      process_gen "u" (Option.value_exn data_gen.u);
-      process_gen "z" (Option.value_exn data_gen.z);
-      process_gen "o" data_gen.o));
+      process_gen "u" u;
+      process_gen "z" z;
+      process_gen "o" o;
+      process_gen "o_noise" (Option.value_exn o_noisy)));
   (* sample from model using inferred u *)
   Array.iteri data ~f:(fun i dat_trial ->
     if Int.(i % C.n_nodes = C.rank)
@@ -364,6 +368,10 @@ let save_results ~prefix prms data =
       in
       process "u" us;
       process "z" zs;
+      AA.save_txt
+        ~out:(file ~prefix (Printf.sprintf "predicted_o_data_%i" i))
+        (AD.unpack_arr dat_trial.o);
+      assert (Array.length os = 1);
       Array.iter ~f:(fun (label, x) -> process label x) os))
 
 
@@ -379,13 +387,6 @@ let config _k =
     ; debias = true
     }
 
-
-(* Converts a boolean to int, sums across all ranks, returns true if any rank had true *)
-(* let mpi_or (x : bool) : bool =
-  let xi = if x then 1 else 0 in
-  let total = C.reduce_sum_int xi in
-  let total = C.broadcast total in
-  total > 0 *)
 
 type early_stop_state =
   { best_loss : float option
@@ -437,7 +438,13 @@ let rec iter ~k ~state_early_stop state =
   then Optimizer.v state
   else (
     let loss, g =
-      Model.elbo_gradient ~n_samples ~mini_batch ~conv_threshold:1E-4 ~reg prms data_train
+      Model.elbo_gradient
+        ~n_samples
+        ~mini_batch
+        ~conv_threshold:1E-4
+        ?reg:reg_arg
+        prms
+        data_train
     in
     (if C.first
      then
