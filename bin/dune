@@ -1,5 +1,5 @@
-(executable
- (name main)
+(executables
+ (names main sim)
  (libraries bos cmdargs ilqr_vae)
  (preprocess
   (pps ppx_sexp_message)))

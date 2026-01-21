@@ -17,9 +17,12 @@ let data_path = Option.value_exn (Cmdargs.get_string "-data")
 (* -----------------------------------------
    ---- Training Arguments -----
    ----------------------------------------- *)
-let n_trials_save = 100
+let n_trials_save = 10
 let n_samples = 100
 let max_iter = 10000
+
+(* observation dim *)
+let o = 256
 
 (* state dim *)
 let n = Option.value_exn (Cmdargs.get_int "-n")
@@ -28,17 +31,19 @@ let n = Option.value_exn (Cmdargs.get_int "-n")
 let m = Option.value_exn (Cmdargs.get_int "-m")
 
 (* whether to use statistics from data to initialise parameters *)
-let a_init = Option.value (Cmdargs.get_bool "-a_init") ~default:false
-let b_init = Option.value (Cmdargs.get_bool "-b_init") ~default:false
-let noise_init = Option.value (Cmdargs.get_bool "-noise_init") ~default:false
-let pin_prior = Option.value (Cmdargs.get_bool "-pin_prior") ~default:false
+let a_init = Cmdargs.get_bool "-a_init" |> Cmdargs.default false
+let b_init = Cmdargs.get_bool "-b_init" |> Cmdargs.default false
+let c_init = Cmdargs.get_bool "-c_init" |> Cmdargs.default true
+let noise_init = Cmdargs.get_bool "-noise_init" |> Cmdargs.default false
+let pin_prior = Cmdargs.get_bool "-pin_prior" |> Cmdargs.default false
+let pin_b = Cmdargs.get_bool "-pin_b" |> Cmdargs.default false
 
 (* learning rate *)
-let lr = Option.value (Cmdargs.get_float "-lr") ~default:0.001
-let decay_rate = Option.value (Cmdargs.get_float "-decay_rate") ~default:1.
-let mini_batch = Option.value (Cmdargs.get_int "-mini_batch") ~default:32
-let use_early_stopping = Option.value (Cmdargs.get_bool "-early_stopping") ~default:false
-let regularise = Option.value (Cmdargs.get_bool "-regularise") ~default:false
+let lr = Cmdargs.get_float "-lr" |> Cmdargs.default 0.001
+let decay_rate = Cmdargs.get_float "-decay_rate" |> Cmdargs.default 1.
+let mini_batch = Cmdargs.get_int "-mini_batch" |> Cmdargs.default 32
+let use_early_stopping = Cmdargs.get_bool "-early_stopping" |> Cmdargs.default false
+let regularise = Cmdargs.get_bool "-regularise" |> Cmdargs.default false
 
 (* -----------------------------------------
    -- Data Read In ---
@@ -68,7 +73,7 @@ let pack_data x =
    -- Param Init Quantities ---
    ----------------------------------------- *)
 type init_info =
-  { c_init : AA.arr
+  { c_init : AA.arr option
   ; a_init : AA.arr option
   ; b_init : AA.arr option
   ; noise_init : AA.arr option
@@ -183,7 +188,8 @@ let param_init_info ~dim x =
       Some noise_init)
     else None
   in
-  { a_init = a; b_init; c_init = init_c pcs; noise_init }
+  let c_init = if c_init then Some (init_c pcs) else None in
+  { a_init = a; b_init; c_init; noise_init }
 
 
 (* Load + preprocess only on rank 0 *)
@@ -227,7 +233,7 @@ module Make_model (P : sig
     val n_beg : int Option.t
   end) =
 struct
-  module U = Prior.Student (struct
+  module U = Prior.Gaussian (struct
       let n_beg = P.n_beg
     end)
 
@@ -291,30 +297,41 @@ let init_prms () =
   C.broadcast' (fun () ->
     let n = setup.n
     and m = setup.m in
-    (* pin prior and prior_recog *)
-    let prior = U.init ~spatial_std:1.0 ~m () in
-    let prior = if pin_prior then U.P.map prior ~f:Prms.pin else prior in
+    (* optionally pin prior and prior_recog *)
+    let prior =
+      let tmp = U.init ~spatial_std:1.0 ~m () in
+      if pin_prior then U.P.map tmp ~f:Prms.pin else tmp
+    in
     let prior_recog = UR.init ~spatial_std:1.0 ~m () in
     let dynamics = D.init ~dt_over_tau:Float.(dt / tau) ~alpha:0.5 ~beta:0.5 ~n ~m () in
     let dynamics =
-      D.P.
-        { a =
-            (match init_info.a_init with
-             | None -> dynamics.a
-             | Some a -> Prms.create (AD.pack_arr a))
-        ; b =
-            (match init_info.b_init with
-             | None -> dynamics.b
-             | Some b ->
-               Some
-                 (Prms.create
-                    (AD.pack_arr Mat.(Float.(1. / of_int n) $* b * gaussian m n))))
-        }
+      let a =
+        match init_info.a_init with
+        | None -> dynamics.a
+        | Some a -> Prms.create (AD.pack_arr a)
+      in
+      let b =
+        match init_info.b_init with
+        | None -> dynamics.b
+        | Some b ->
+          Some (Prms.create (AD.pack_arr Mat.(Float.(1. / of_int n) $* b * gaussian m n)))
+      in
+      let b = if pin_b then Option.map ~f:Prms.pin b else b in
+      D.P.{ a; b }
     in
     let likelihood =
       let likelihood_tmp =
         let tmp = L.init ~scale:1. ~sigma2:1. ~n ~n_output () in
-        { tmp with c = Prms.create (AD.pack_arr init_info.c_init) }
+        let c =
+          match init_info.c_init with
+          | None -> tmp.c
+          | Some c -> Prms.create (AD.pack_arr c)
+        in
+        { tmp with c }
+        (* TODO: pin c to identity *)
+        (* let c = Mat.eye o |> AD.pack_arr |> Prms.create |> Prms.pin in
+        let bias = AD.Mat.create 1 n_output 0. |> Prms.create |> Prms.pin in *)
+        (* { tmp with c; bias } *)
       in
       { likelihood_tmp with
         variances =
@@ -394,7 +411,7 @@ type early_stop_state =
   ; patience : int
   }
 
-let check_early_stop state current_loss =
+let check_early_stop ~state current_loss =
   match state.best_loss with
   | None -> false, Some { state with best_loss = Some current_loss; wait = 0 }
   | Some best ->
@@ -405,10 +422,10 @@ let check_early_stop state current_loss =
       wait > state.patience, Some { state with wait })
 
 
-let rec iter ~k ~state_early_stop state =
+let rec iter ~k ~state_early_stop ~curr_best state =
   let prms = Model.broadcast_prms (Optimizer.v state) in
   (* Evaluate test loss every 100 iterations *)
-  let stop_test, state_early_stop =
+  let reached_best, curr_best, stop_test, state_early_stop =
     if Int.(k % 100 = 0)
     then (
       let test_loss =
@@ -418,6 +435,15 @@ let rec iter ~k ~state_early_stop state =
           (Model.P.value prms)
           data_test
       in
+      let reached_best, curr_best =
+        (match curr_best with
+         | None -> true, Some test_loss
+         | Some curr_best ->
+           if Float.(test_loss < curr_best)
+           then true, Some test_loss
+           else false, Some curr_best)
+        |> C.broadcast
+      in
       if C.first
       then (
         Optimizer.save ~out:(in_dir "state.bin") state;
@@ -425,13 +451,17 @@ let rec iter ~k ~state_early_stop state =
           save_txt
             ~append:true
             ~out:(in_dir "test_loss")
-            (of_array [| Float.of_int k; test_loss |] [| 1; 2 |]));
-        save_results ~prefix:(in_dir "final") prms data_save_results);
-      match state_early_stop with
-      | Some state_early_stop -> check_early_stop state_early_stop test_loss
-      | None -> false, None)
-    else false, state_early_stop
+            (of_array [| Float.of_int k; test_loss |] [| 1; 2 |])));
+      save_results ~prefix:(in_dir "final") prms data_save_results;
+      let stop_early, state_early_stop =
+        match state_early_stop with
+        | Some state_early_stop -> check_early_stop ~state:state_early_stop test_loss
+        | None -> false, None
+      in
+      reached_best, curr_best, stop_early, state_early_stop)
+    else false, curr_best, false, state_early_stop
   in
+  if reached_best then save_results ~prefix:(in_dir "best") prms data_save_results;
   let local_stop = if C.rank = 0 then stop_test || Int.(k >= max_iter) else false in
   let stop = C.broadcast local_stop in
   if stop
@@ -459,7 +489,7 @@ let rec iter ~k ~state_early_stop state =
       | Some g -> Optimizer.step ~config:(config k) ~info:g state
     in
     if Int.(k % 100 = 0) then print [%message (k : int) (loss : float)];
-    iter ~k:(k + 1) ~state_early_stop state)
+    iter ~k:(k + 1) ~state_early_stop ~curr_best state)
 
 
 let final_prms =
@@ -472,7 +502,7 @@ let final_prms =
   let state_early_stop =
     if use_early_stopping then Some { best_loss = None; wait = 0; patience = 5 } else None
   in
-  iter ~k:0 ~state_early_stop state
+  iter ~k:0 ~state_early_stop ~curr_best:None state
 
 
 let _ = save_results ~prefix:(in_dir "final") final_prms data_save_results
