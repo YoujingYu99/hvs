@@ -77,11 +77,12 @@ let tau = 0.02
 (* observation dim *)
 let n_output = 16 * 16
 let setup = { n; m; n_trials = n_trials_save; n_steps }
+let n_beg = Int.(setup.n / setup.m)
 let n_samples = 100
 
 module M = Make_model (struct
     let setup = setup
-    let n_beg = Some (setup.n / setup.m)
+    let n_beg = Some n_beg
   end)
 
 open M
@@ -90,7 +91,12 @@ let file ~prefix s = prefix ^ "." ^ s
 
 let process_gen ~i ~prefix ~prepend label a =
   let a = AD.unpack_arr a in
-  AA.reshape a [| setup.n_steps; -1 |]
+  let shape =
+    if String.(label = "u")
+    then [| setup.n_steps + n_beg - 1; -1 |]
+    else [| setup.n_steps; -1 |]
+  in
+  AA.reshape a shape
   |> AA.save_txt ~out:(file ~prefix (Printf.sprintf "%s_%s_%i" prepend label i))
 
 
@@ -109,8 +115,12 @@ let save_generative_results ~prefix prms =
 
 let save_impulse_response ~prefix prms =
   let prepend = Printf.sprintf "impulse_channel" in
-  let n_sim = Int.(n_steps + (setup.n / setup.m) - 1) in
-  let u_channel = AD.(Mat.ones n_sim 1) in
+  let n_sim = Int.(setup.n_steps + n_beg - 1) in
+  let u_channel =
+    let impulse = AD.(Mat.ones n_beg 1) in
+    let zeros = AD.(Mat.zeros (setup.n_steps - 1) 1) in
+    AD.Maths.concatenate ~axis:0 [| impulse; zeros |]
+  in
   List.iter (List.range 0 setup.m) ~f:(fun i ->
     if Int.(i % C.n_nodes = C.rank)
     then (
