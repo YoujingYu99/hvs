@@ -17,9 +17,11 @@ let n = Option.value_exn (Cmdargs.get_int "-n")
 (* control dim *)
 let m = Option.value_exn (Cmdargs.get_int "-m")
 let in_dir = Cmdargs.in_dir "-results"
-let n_trials_save = Cmdargs.get_int "-n_trials_save" |> Cmdargs.default 10
-let n_steps = Cmdargs.get_int "-n_steps" |> Cmdargs.default 1000
+let n_trials_save = Cmdargs.get_int "-n_trials_save" |> Cmdargs.default 2
+let n_steps = Cmdargs.get_int "-n_steps" |> Cmdargs.default 10
 let chkpt_type = Cmdargs.get_string "-chkpt_type" |> Cmdargs.default "best"
+let save_generative = Cmdargs.get_bool "-save_generative" |> Cmdargs.default true
+let save_impulse = Cmdargs.get_bool "-save_impulse_response" |> Cmdargs.default false
 
 (* -----------------------------------------
    -- Model Set-up ---
@@ -86,21 +88,51 @@ open M
 
 let file ~prefix s = prefix ^ "." ^ s
 
-let save_results ~prefix prms =
+let process_gen ~i ~prefix ~prepend label a =
+  let a = AD.unpack_arr a in
+  AA.reshape a [| setup.n_steps; -1 |]
+  |> AA.save_txt ~out:(file ~prefix (Printf.sprintf "%s_%s_%i" prepend label i))
+
+
+let save_generative_results ~prefix prms =
+  let prepend = "generative" in
   (* sample from model parameters *)
   List.iter (List.range 0 n_trials_save) ~f:(fun i ->
     if Int.(i % C.n_nodes = C.rank)
     then (
-      let u, z, o, o_noisy = Model.sample_generative ~noisy:true prms in
-      let process_gen label a =
-        let a = AD.unpack_arr a in
-        AA.reshape a [| setup.n_steps; -1 |]
-        |> AA.save_txt ~out:(file ~prefix (Printf.sprintf "generated_%s_%i" label i))
+      let u, z, o, o_noisy = Model.sample_generative ~noisy:true ~prms in
+      process_gen ~i ~prefix ~prepend "u" u;
+      process_gen ~i ~prefix ~prepend "z" z;
+      process_gen ~i ~prefix ~prepend "o" o;
+      process_gen ~i ~prefix ~prepend "o_noise" (Option.value_exn o_noisy)))
+
+
+let save_impulse_response ~prefix prms =
+  let prepend = Printf.sprintf "impulse_channel" in
+  let n_sim = Int.(n_steps + (setup.n / setup.m) - 1) in
+  let u_channel = AD.(Mat.ones n_sim 1) in
+  List.iter (List.range 0 setup.m) ~f:(fun i ->
+    if Int.(i % C.n_nodes = C.rank)
+    then (
+      let u =
+        if i = 0
+        then
+          AD.Maths.concatenate ~axis:1 [| u_channel; AD.Mat.zeros n_sim (setup.m - 1) |]
+        else if i = setup.m - 1
+        then
+          AD.Maths.concatenate ~axis:1 [| AD.Mat.zeros n_sim (setup.m - 1); u_channel |]
+        else
+          AD.Maths.concatenate
+            ~axis:1
+            [| AD.Mat.zeros n_sim i; u_channel; AD.Mat.zeros n_sim (setup.m - 1 - i) |]
       in
-      process_gen "u" u;
-      process_gen "z" z;
-      process_gen "o" o;
-      process_gen "o_noise" (Option.value_exn o_noisy)))
+      let u_impulse, z_impulse, o_impulse, o_noisy_impulse =
+        Model.sample_forward ~noisy:true ~u ~prms
+      in
+      process_gen ~i ~prefix ~prepend "u" u_impulse;
+      process_gen ~i ~prefix ~prepend "z" z_impulse;
+      process_gen ~i ~prefix ~prepend "o" o_impulse;
+      process_gen ~i ~prefix ~prepend "o_noise" (Option.value_exn o_noisy_impulse)))
 
 
 (* Simulate from model parameters *)
@@ -109,4 +141,11 @@ let _ =
     C.broadcast' (fun () ->
       Misc.read_bin (in_dir chkpt_type ^ ".params.bin") |> Model.P.value)
   in
-  save_results ~prefix:(in_dir chkpt_type ^ "_t_" ^ Int.to_string n_steps) prms
+  if save_generative
+  then
+    save_generative_results
+      ~prefix:(in_dir chkpt_type ^ "_t_" ^ Int.to_string n_steps)
+      prms;
+  if save_impulse
+  then
+    save_impulse_response ~prefix:(in_dir chkpt_type ^ "_t_" ^ Int.to_string n_steps) prms

@@ -358,7 +358,7 @@ let save_results ~prefix prms data =
   List.iter (List.range 0 n_trials_save) ~f:(fun i ->
     if Int.(i % C.n_nodes = C.rank)
     then (
-      let u, z, o, o_noisy = Model.sample_generative ~noisy:true prms in
+      let u, z, o, o_noisy = Model.sample_generative ~noisy:true ~prms in
       let process_gen label a =
         let a = AD.unpack_arr a in
         AA.reshape a [| setup.n_steps; -1 |]
