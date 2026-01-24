@@ -21,6 +21,11 @@ let n_trials_save = Cmdargs.get_int "-n_trials_save" |> Cmdargs.default 2
 let n_steps = Cmdargs.get_int "-n_steps" |> Cmdargs.default 10
 let chkpt_type = Cmdargs.get_string "-chkpt_type" |> Cmdargs.default "best"
 let save_generative = Cmdargs.get_bool "-save_generative" |> Cmdargs.default true
+
+let save_generative_autonomous =
+  Cmdargs.get_bool "-save_generative_autonomous" |> Cmdargs.default false
+
+
 let save_impulse = Cmdargs.get_bool "-save_impulse_response" |> Cmdargs.default false
 
 (* -----------------------------------------
@@ -101,12 +106,27 @@ let process_gen ~i ~prefix ~prepend label a =
 
 
 let save_generative_results ~prefix prms =
-  let prepend = "generative" in
+  let prepend = "generated" in
   (* sample from model parameters *)
   List.iter (List.range 0 n_trials_save) ~f:(fun i ->
     if Int.(i % C.n_nodes = C.rank)
     then (
       let u, z, o, o_noisy = Model.sample_generative ~noisy:true ~prms in
+      process_gen ~i ~prefix ~prepend "u" u;
+      process_gen ~i ~prefix ~prepend "z" z;
+      process_gen ~i ~prefix ~prepend "o" o;
+      process_gen ~i ~prefix ~prepend "o_noise" (Option.value_exn o_noisy)))
+
+
+let save_autonomous_generative_results ~prefix prms =
+  let prepend = "generated_autonomous" in
+  (* sample from model parameters *)
+  List.iter (List.range 0 n_trials_save) ~f:(fun i ->
+    if Int.(i % C.n_nodes = C.rank)
+    then (
+      let u, z, o, o_noisy =
+        Model.sample_generative_autonomous ~noisy:true ~sigma:0.1 ~prms
+      in
       process_gen ~i ~prefix ~prepend "u" u;
       process_gen ~i ~prefix ~prepend "z" z;
       process_gen ~i ~prefix ~prepend "o" o;
@@ -151,6 +171,11 @@ let _ =
     C.broadcast' (fun () ->
       Misc.read_bin (in_dir chkpt_type ^ ".params.bin") |> Model.P.value)
   in
+  if save_generative_autonomous
+  then
+    save_autonomous_generative_results
+      ~prefix:(in_dir chkpt_type ^ "_t_" ^ Int.to_string n_steps)
+      prms;
   if save_generative
   then
     save_generative_results

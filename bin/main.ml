@@ -272,10 +272,11 @@ let tau = 0.02
 (* observation dim *)
 let n_output = 16 * 16
 let setup = { n; m; n_trials = train_batch_size; n_steps = tmax }
+let n_beg = Int.(setup.n / setup.m)
 
 module M = Make_model (struct
     let setup = setup
-    let n_beg = Some (setup.n / setup.m)
+    let n_beg = Some n_beg
   end)
 
 open M
@@ -330,8 +331,8 @@ let init_prms () =
         { tmp with c }
         (* TODO: pin c to identity *)
         (* let c = Mat.eye o |> AD.pack_arr |> Prms.create |> Prms.pin in
-        let bias = AD.Mat.create 1 n_output 0. |> Prms.create |> Prms.pin in *)
-        (* { tmp with c; bias } *)
+        let bias = AD.Mat.create 1 n_output 0. |> Prms.create |> Prms.pin in
+        { tmp with c; bias } *)
       in
       { likelihood_tmp with
         variances =
@@ -361,7 +362,12 @@ let save_results ~prefix prms data =
       let u, z, o, o_noisy = Model.sample_generative ~noisy:true ~prms in
       let process_gen label a =
         let a = AD.unpack_arr a in
-        AA.reshape a [| setup.n_steps; -1 |]
+        let shape =
+          if String.(label = "u")
+          then [| setup.n_steps + n_beg - 1; -1 |]
+          else [| setup.n_steps; -1 |]
+        in
+        AA.reshape a shape
         |> AA.save_txt ~out:(file ~prefix (Printf.sprintf "generated_%s_%i" label i))
       in
       process_gen "u" u;
