@@ -44,6 +44,8 @@ let decay_rate = Cmdargs.get_float "-decay_rate" |> Cmdargs.default 1.
 let mini_batch = Cmdargs.get_int "-mini_batch" |> Cmdargs.default 32
 let use_early_stopping = Cmdargs.get_bool "-early_stopping" |> Cmdargs.default false
 let regularise = Cmdargs.get_bool "-regularise" |> Cmdargs.default false
+let k = Cmdargs.get_int "-k" |> Cmdargs.default 0
+let reuse = Cmdargs.get_string "-reuse"
 
 (* -----------------------------------------
    -- Data Read In ---
@@ -382,20 +384,38 @@ let save_results ~prefix prms data =
       AA.save_txt
         ~out:(file ~prefix (Printf.sprintf "posterior_u_%i" i))
         (AD.unpack_arr mu);
-      let us, zs, os = Model.predictions ~n_samples ~prms mu in
-      let process label a =
+      let u_inits, us, zs, os = Model.predictions ~n_samples ~prms mu in
+      let process ?(shape = [| setup.n_steps; -1 |]) label a =
         let a = AD.unpack_arr a in
         AA.(mean ~axis:2 a @|| var ~axis:2 a)
-        |> (fun z -> AA.reshape z [| setup.n_steps; -1 |])
+        |> (fun z -> AA.reshape z shape)
         |> AA.save_txt ~out:(file ~prefix (Printf.sprintf "predicted_%s_%i" label i))
       in
       process "u" us;
+      process "u_inits" ~shape:[| n_beg; -1 |] us;
       process "z" zs;
+      let _u_inits = AD.unpack_arr u_inits in
+      AA.(mean ~axis:2 _u_inits @|| var ~axis:2 _u_inits)
+      |> (fun z -> AA.reshape z [| n_beg; -1 |])
+      |> AA.save_txt ~out:(file ~prefix (Printf.sprintf "predicted_%s_%i" "u_inits" i));
       AA.save_txt
         ~out:(file ~prefix (Printf.sprintf "predicted_o_data_%i" i))
         (AD.unpack_arr dat_trial.o);
       assert (Array.length os = 1);
-      Array.iter ~f:(fun (label, x) -> process label x) os))
+      Array.iter ~f:(fun (label, x) -> process label x) os;
+      let us_init = u_inits |> AD.unpack_arr |> AA.mean ~axis:2 ~keep_dims:false in
+      let u, z, o, o_noisy =
+        Model.sample_generative_autonomous ~noisy:true ~u_init:us_init ~sigma:0.1 ~prms ()
+      in
+      let save_predicted_auto label a =
+        AA.save_txt
+          ~out:(file ~prefix (Printf.sprintf "predicted_auto_%s_%i" label i))
+          (AD.unpack_arr a)
+      in
+      save_predicted_auto "u" u;
+      save_predicted_auto "z" z;
+      save_predicted_auto "o" o;
+      save_predicted_auto "o_noisy" (Option.value_exn o_noisy)))
 
 
 module Optimizer = Opt.Adam.Make (Model.P)
@@ -500,15 +520,20 @@ let rec iter ~k ~state_early_stop ~curr_best state =
 
 let final_prms =
   let state =
-    match Cmdargs.get_string "-reuse" with
-    | Some file -> Optimizer.load file
-    | None -> Optimizer.init (init_prms ())
+    match reuse with
+    | Some file ->
+      print [%message "reusing last checkpoint"];
+      Optimizer.load file
+    | None ->
+      let init_params = init_prms () in
+      save_params ~prefix:(in_dir "init") init_params;
+      Optimizer.init init_params
   in
-  save_params ~prefix:(in_dir "init") (Optimizer.v state);
+  print [%message "training starts"];
   let state_early_stop =
     if use_early_stopping then Some { best_loss = None; wait = 0; patience = 5 } else None
   in
-  iter ~k:0 ~state_early_stop ~curr_best:None state
+  iter ~k ~state_early_stop ~curr_best:None state
 
 
 let _ = save_results ~prefix:(in_dir "final") final_prms data_save_results
