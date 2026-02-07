@@ -1,5 +1,5 @@
 (executables
- (names main mgu2 sim)
+ (names train sim)
  (libraries bos cmdargs ilqr_vae)
  (preprocess
   (pps ppx_sexp_message)))

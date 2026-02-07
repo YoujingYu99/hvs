@@ -1,8 +1,10 @@
-(* Linear Gaussian Dynamics on HVS data with the new modular framework *)
+(* MGU2 on HVS data with the new modular framework *)
 open Base
 open Ilqr_vae
 open Misc
 open Vae
+open Config
+open Models
 module Mat = Owl.Dense.Matrix.S
 module Arr = Owl.Dense.Ndarray.S
 
@@ -18,11 +20,7 @@ let data_path = Option.value_exn (Cmdargs.get_string "-data")
    ---- Training Arguments -----
    ----------------------------------------- *)
 let n_trials_save = 10
-let n_samples = 100
 let max_iter = 10000
-
-(* observation dim *)
-let o = 256
 
 (* state dim *)
 let n = Option.value_exn (Cmdargs.get_int "-n")
@@ -32,7 +30,6 @@ let m = Option.value_exn (Cmdargs.get_int "-m")
 
 (* whether to use statistics from data to initialise parameters *)
 let a_init = Cmdargs.get_bool "-a_init" |> Cmdargs.default false
-let b_init = Cmdargs.get_bool "-b_init" |> Cmdargs.default false
 let c_init = Cmdargs.get_bool "-c_init" |> Cmdargs.default true
 let noise_init = Cmdargs.get_bool "-noise_init" |> Cmdargs.default false
 let pin_prior = Cmdargs.get_bool "-pin_prior" |> Cmdargs.default false
@@ -74,12 +71,6 @@ let pack_data x =
 (* -----------------------------------------
    -- Param Init Quantities ---
    ----------------------------------------- *)
-type init_info =
-  { c_init : AA.arr option
-  ; a_init : AA.arr option
-  ; b_init : AA.arr option
-  ; noise_init : AA.arr option
-  }
 
 (* Compute pcs. x has shape [n_trials x tmax x o] *)
 let pcs ~dim x =
@@ -116,24 +107,18 @@ let z_inferred ~pcs x =
   z
 
 
-let z_0 z = AA.get_slice [ []; [ 0; -2 ]; [] ] z
-let z_1 z = AA.get_slice [ []; [ 1; -1 ]; [] ] z
-
 (* regression to fit state transition matrix. a = (z_1 z_0^T)^{-1}(z_0 z_0^T) *)
-let compute_a ~z_0 ~z_1 =
+let compute_a ~z ~dim =
   (* [ dim x (5000 x tmax-1) ] *)
-  let z_0 = AA.transpose z_0
-  and z_1 = AA.transpose z_1 in
+  let z_0 =
+    AA.get_slice [ []; [ 0; -2 ]; [] ] z
+    |> fun x -> AA.reshape x [| -1; dim |] |> AA.transpose
+  and z_1 =
+    AA.get_slice [ []; [ 1; -1 ]; [] ] z
+    |> fun x -> AA.reshape x [| -1; dim |] |> AA.transpose
+  in
   let to_inv = Mat.(z_0 *@ transpose z_0) in
   Mat.(z_1 *@ transpose z_0 *@ svd_inv to_inv)
-
-
-(* std of state residual for scale of b matrix initialisation *)
-let compute_b ~z_0 ~z_1 ~a =
-  let a_z0 = Mat.(z_0 *@ transpose a) in
-  (* [ 5000 x (tmax-1) x dim ] *)
-  let diff = AA.(reshape (z_1 - a_z0) (shape z_0)) in
-  AA.std ~axis:0 ~keep_dims:true diff
 
 
 (* std of observation residual for scale of noise initialisation *)
@@ -150,6 +135,12 @@ let compute_noise_init ~z ~c ~x =
   AA.var ~axis:0 ~keep_dims:true diff
 
 
+type init_info =
+  { a_init : AA.arr option
+  ; c_init : AA.arr option
+  ; noise_init : AA.arr option
+  }
+
 (* Compute info needed for initialising parameters *)
 let param_init_info ~dim x =
   (* use a subset of x for computation *)
@@ -157,30 +148,12 @@ let param_init_info ~dim x =
   let x = AA.get_fancy [ L ids; R []; R [] ] x in
   let pcs = pcs ~dim x in
   let z = z_inferred ~pcs x in
-  let z_0 = z_0 z
-  and z_1 = z_1 z in
-  let z_0_ = AA.reshape z_0 [| -1; dim |] in
-  let z_1_ = AA.reshape z_1 [| -1; dim |] in
   (* [ 5000 x (tmax-1) x dim ] *)
   let a =
     if a_init
     then (
-      let a = compute_a ~z_0:z_0_ ~z_1:z_1_ in
+      let a = compute_a ~z ~dim in
       Some a)
-    else None
-  in
-  let b_init =
-    if b_init
-    then (
-      let b =
-        let a =
-          match a with
-          | None -> compute_a ~z_0:z_0_ ~z_1:z_1_
-          | Some a -> a
-        in
-        compute_b ~z_0:z_0_ ~z_1:z_1_ ~a
-      in
-      Some b)
     else None
   in
   let noise_init =
@@ -191,7 +164,7 @@ let param_init_info ~dim x =
     else None
   in
   let c_init = if c_init then Some (init_c pcs) else None in
-  { a_init = a; b_init; c_init; noise_init }
+  { a_init = a; c_init; noise_init }
 
 
 (* Load + preprocess only on rank 0 *)
@@ -221,62 +194,12 @@ let tmax, init_info, data_train, train_batch_size, data_save_results, data_test 
 
 
 (* -----------------------------------------
-   -- Model Set-up ---
-   ----------------------------------------- *)
-type setup =
-  { n : int
-  ; m : int
-  ; n_trials : int
-  ; n_steps : int
-  }
-
-module Make_model (P : sig
-    val setup : setup
-    val n_beg : int Option.t
-  end) =
-struct
-  module U = Prior.Gaussian (struct
-      let n_beg = P.n_beg
-    end)
-
-  module UR = Prior.Gaussian (struct
-      let n_beg = P.n_beg
-    end)
-
-  module L = Likelihood.Gaussian (struct
-      let label = "o"
-      let normalize_c = false
-    end)
-
-  module D = Dynamics.Linear_unconstrained (struct
-      let n_beg = P.n_beg
-    end)
-
-  module Model =
-    Vae.Make (U) (UR) (D) (L)
-      (struct
-        let n = P.setup.n
-        let m = P.setup.m
-        let n_steps = P.setup.n_steps
-        let diag_time_cov = false
-        let n_beg = P.n_beg
-      end)
-end
-
-(* -----------------------------------------
    -- Initialise parameters and train
    ----------------------------------------- *)
-(* sampling frequency of the data *)
-let fs = 651.
-let dt = Float.(1. / fs)
-let tau = 0.02
-
-(* observation dim *)
-let n_output = 16 * 16
 let setup = { n; m; n_trials = train_batch_size; n_steps = tmax }
 let n_beg = Int.(setup.n / setup.m)
 
-module M = Make_model (struct
+module M = Make_model_LDS (struct
     let setup = setup
     let n_beg = Some n_beg
   end)
@@ -284,7 +207,11 @@ module M = Make_model (struct
 open M
 
 let reg ~(prms : Model.P.t') =
+  (* if MGU *)
   let z = Float.(1e-5 / of_int Int.(setup.n * setup.n)) in
+  (* let part1 = AD.Maths.(F z * l2norm_sqr' prms.dynamics.uh) in
+  let part2 = AD.Maths.(F z * l2norm_sqr' prms.dynamics.uf) in
+  AD.Maths.(part1 + part2) *)
   let a = prms.dynamics.a in
   let a_reg = AD.Maths.(F z * l2norm_sqr' a) in
   match prms.dynamics.b with
@@ -306,6 +233,7 @@ let init_prms () =
       if pin_prior then U.P.map tmp ~f:Prms.pin else tmp
     in
     let prior_recog = UR.init ~spatial_std:1.0 ~m () in
+    (* if LDS *)
     let dynamics = D.init ~dt_over_tau:Float.(dt / tau) ~alpha:0.5 ~beta:0.5 ~n ~m () in
     let dynamics =
       let a =
@@ -313,15 +241,12 @@ let init_prms () =
         | None -> dynamics.a
         | Some a -> Prms.create (AD.pack_arr a)
       in
-      let b =
-        match init_info.b_init with
-        | None -> dynamics.b
-        | Some b ->
-          Some (Prms.create (AD.pack_arr Mat.(Float.(1. / of_int n) $* b * gaussian m n)))
-      in
+      let b = dynamics.b in
       let b = if pin_b then Option.map ~f:Prms.pin b else b in
       D.P.{ a; b }
     in
+    (* if MGU *)
+    (* let dynamics = D.init ~n ~m () in *)
     let likelihood =
       let likelihood_tmp =
         let tmp = L.init ~scale:1. ~sigma2:1. ~n ~n_output () in
@@ -331,10 +256,6 @@ let init_prms () =
           | Some c -> Prms.create (AD.pack_arr c)
         in
         { tmp with c }
-        (* TODO: pin c to identity *)
-        (* let c = Mat.eye o |> AD.pack_arr |> Prms.create |> Prms.pin in
-        let bias = AD.Mat.create 1 n_output 0. |> Prms.create |> Prms.pin in
-        { tmp with c; bias } *)
       in
       { likelihood_tmp with
         variances =

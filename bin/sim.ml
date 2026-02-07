@@ -3,6 +3,8 @@ open Base
 open Ilqr_vae
 open Misc
 open Vae
+open Config
+open Models
 module Mat = Owl.Dense.Matrix.S
 module Arr = Owl.Dense.Ndarray.S
 
@@ -19,7 +21,7 @@ let n = Option.value_exn (Cmdargs.get_int "-n")
 (* control dim *)
 let m = Option.value_exn (Cmdargs.get_int "-m")
 let in_dir = Cmdargs.in_dir "-results"
-let n_trials_save = Cmdargs.get_int "-n_trials_save" |> Cmdargs.default 2
+let n_trials_save = Cmdargs.get_int "-n_trials_save" |> Cmdargs.default 100
 let n_steps = Cmdargs.get_int "-n_steps" |> Cmdargs.default 10
 let chkpt_type = Cmdargs.get_string "-chkpt_type" |> Cmdargs.default "best"
 let save_generative = Cmdargs.get_bool "-save_generative" |> Cmdargs.default true
@@ -35,68 +37,16 @@ let save_generative_autonomous_inferred =
 
 
 (* -----------------------------------------
-   -- Model Set-up ---
-   ----------------------------------------- *)
-type setup =
-  { n : int
-  ; m : int
-  ; n_trials : int
-  ; n_steps : int
-  }
-
-module Make_model (P : sig
-    val setup : setup
-    val n_beg : int Option.t
-  end) =
-struct
-  module U = Prior.Gaussian (struct
-      let n_beg = P.n_beg
-    end)
-
-  module UR = Prior.Gaussian (struct
-      let n_beg = P.n_beg
-    end)
-
-  module L = Likelihood.Gaussian (struct
-      let label = "o"
-      let normalize_c = false
-    end)
-
-  module D = Dynamics.Linear_unconstrained (struct
-      let n_beg = P.n_beg
-    end)
-
-  module Model =
-    Vae.Make (U) (UR) (D) (L)
-      (struct
-        let n = P.setup.n
-        let m = P.setup.m
-        let n_steps = P.setup.n_steps
-        let diag_time_cov = false
-        let n_beg = P.n_beg
-      end)
-end
-
-(* -----------------------------------------
    -- Initialise parameters and train
    ----------------------------------------- *)
-(* sampling frequency of the data *)
-let fs = 651.
-let dt = Float.(1. / fs)
-let tau = 0.02
 
-(* observation dim *)
-let n_output = 16 * 16
 let setup = { n; m; n_trials = n_trials_save; n_steps }
 let n_beg = Int.(setup.n / setup.m)
-let n_samples = 100
 
-module M = Make_model (struct
+module M = Make_model_LDS (struct
     let setup = setup
     let n_beg = Some n_beg
   end)
-
-(* open M *)
 
 let pack_o o = { Vae.u = None; z = None; o = AD.pack_arr o }
 
@@ -215,7 +165,7 @@ let save_impulse_response ~prefix prms =
 let save_autonomous_test_ic_results ~prefix prms data =
   let setup = { n; m; n_trials = n_trials_save; n_steps = data_n_steps } in
   let module M_D =
-    Make_model (struct
+    Make_model_LDS (struct
       let setup = setup
       let n_beg = Some n_beg
     end)
