@@ -209,19 +209,19 @@ open M
 let reg ~(prms : Model.P.t') =
   let z = Float.(1e-5 / of_int Int.(setup.n * setup.n)) in
   (* if MGU *)
-  
   let part1 = AD.Maths.(F z * l2norm_sqr' prms.dynamics.uh) in
   let part2 = AD.Maths.(F z * l2norm_sqr' prms.dynamics.uf) in
   AD.Maths.(part1 + part2)
-  (* if LDS *)
-  (* let a = prms.dynamics.a in
+
+
+(* if LDS *)
+(* let a = prms.dynamics.a in
   let a_reg = AD.Maths.(F z * l2norm_sqr' a) in
   match prms.dynamics.b with
   | None -> a_reg
   | Some b ->
     let b_reg = AD.Maths.(F z * l2norm_sqr' b) in
     AD.Maths.(a_reg + b_reg) *)
-
 
 let reg_arg = if regularise then Some reg else None
 
@@ -277,68 +277,66 @@ let save_params ~prefix prms =
     Model.P.save_txt ~prefix prms)
 
 
-let save_results ~prefix prms data =
-  save_params ~prefix prms;
-  let prms = Model.P.value prms in
+let process_gen ~i ?(n_steps = setup.n_steps) ~prefix ~prepend label a =
+  let a = AD.unpack_arr a in
+  let shape = if String.(label = "u") then [| n_steps; -1 |] else [| n_steps; -1 |] in
+  AA.reshape a shape
+  |> AA.save_txt ~out:(file ~prefix (Printf.sprintf "%s_%s_%i" prepend label i))
+
+
+let save_generative_results ~prefix prms =
+  let prepend = "generated" in
+  let open M in
   (* sample from model parameters *)
   List.iter (List.range 0 n_trials_save) ~f:(fun i ->
     if Int.(i % C.n_nodes = C.rank)
     then (
-      let u, z, o, o_noisy = Model.sample_generative ~noisy:true ~prms in
-      let process_gen label a =
-        let a = AD.unpack_arr a in
-        let shape =
-          if String.(label = "u")
-          then [| setup.n_steps + n_beg - 1; -1 |]
-          else [| setup.n_steps; -1 |]
-        in
-        AA.reshape a shape
-        |> AA.save_txt ~out:(file ~prefix (Printf.sprintf "generated_%s_%i" label i))
-      in
-      process_gen "u" u;
-      process_gen "z" z;
-      process_gen "o" o;
-      process_gen "o_noise" (Option.value_exn o_noisy)));
+      let u, z, o, _ = Model.sample_generative ~noisy:false ~prms in
+      process_gen ~i ~prefix ~prepend "u" u;
+      process_gen ~i ~prefix ~prepend "z" z;
+      process_gen ~i ~prefix ~prepend "o" o))
+
+
+let ic_only mu =
+  let open AD.Maths in
+  let mu0 = get_slice [ [ 0 ] ] mu in
+  let rest = AD.Mat.zeros Int.(AD.(shape mu).(0) - 1) AD.(shape mu).(1) in
+  concat ~axis:0 mu0 rest
+
+
+let save_autonomous_test_ic_results ~prefix prms data =
+  let process ~id ~prefix label a =
+    a
+    |> AD.unpack_arr
+    |> (fun z -> AA.reshape z [| setup.n_steps; -1 |])
+    |> AA.save_txt ~out:(file ~prefix (Printf.sprintf "predicted_%s_%i" label id))
+  in
   (* sample from model using inferred u *)
   Array.iteri data ~f:(fun i dat_trial ->
     if Int.(i % C.n_nodes = C.rank)
     then (
-      let mu = Model.posterior_mean ~prms dat_trial in
+      let mu : AD.t = Model.posterior_mean ~prms dat_trial in
+      let us, zs, os = Model.predictions_deterministic ~prms mu in
+      let us0, zs0, os0 = Model.predictions_deterministic ~prms (ic_only mu) in
       AA.save_txt
         ~out:(file ~prefix (Printf.sprintf "posterior_u_%i" i))
         (AD.unpack_arr mu);
-      let u_inits, us, zs, os = Model.predictions ~n_samples ~prms mu in
-      let process ?(shape = [| setup.n_steps; -1 |]) label a =
-        let a = AD.unpack_arr a in
-        AA.(mean ~axis:2 a @|| var ~axis:2 a)
-        |> (fun z -> AA.reshape z shape)
-        |> AA.save_txt ~out:(file ~prefix (Printf.sprintf "predicted_%s_%i" label i))
-      in
-      process "u" us;
-      process "u_inits" ~shape:[| n_beg; -1 |] us;
-      process "z" zs;
-      let _u_inits = AD.unpack_arr u_inits in
-      AA.(mean ~axis:2 _u_inits @|| var ~axis:2 _u_inits)
-      |> (fun z -> AA.reshape z [| n_beg; -1 |])
-      |> AA.save_txt ~out:(file ~prefix (Printf.sprintf "predicted_%s_%i" "u_inits" i));
-      AA.save_txt
-        ~out:(file ~prefix (Printf.sprintf "predicted_o_data_%i" i))
-        (AD.unpack_arr dat_trial.o);
-      assert (Array.length os = 1);
-      Array.iter ~f:(fun (label, x) -> process label x) os;
-      let us_init = u_inits |> AD.unpack_arr |> AA.mean ~axis:2 ~keep_dims:false in
-      let u, z, o, o_noisy =
-        Model.sample_generative_autonomous ~noisy:true ~u_init:us_init ~sigma:0.1 ~prms ()
-      in
-      let save_predicted_auto label a =
-        AA.save_txt
-          ~out:(file ~prefix (Printf.sprintf "predicted_auto_%s_%i" label i))
-          (AD.unpack_arr a)
-      in
-      save_predicted_auto "u" u;
-      save_predicted_auto "z" z;
-      save_predicted_auto "o" o;
-      save_predicted_auto "o_noisy" (Option.value_exn o_noisy)))
+      (* model inferred u *)
+      process ~id:i ~prefix "u" us;
+      process ~id:i ~prefix "z" zs;
+      process ~id:i ~prefix "o" (snd os.(0));
+      (* autonomous ic *)
+      process ~id:i ~prefix "ic_u" us0;
+      process ~id:i ~prefix "ic_z" zs0;
+      process ~id:i ~prefix "ic_o" (snd os0.(0))))
+
+
+let save_results ~prefix prms data =
+  save_params ~prefix prms;
+  let prms = Model.P.value prms in
+  (* sample from model parameters *)
+  save_generative_results ~prefix prms;
+  save_autonomous_test_ic_results ~prefix prms data
 
 
 module Optimizer = Opt.Adam.Make (Model.P)
