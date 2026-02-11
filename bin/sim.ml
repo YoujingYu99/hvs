@@ -88,12 +88,10 @@ let data_save_results, data_n_steps =
 
 let file ~prefix s = prefix ^ "." ^ s
 
-let process_gen ~i ~prefix ~prepend label a =
+let process_gen ~i ?(n_steps = setup.n_steps) ~prefix ~prepend label a =
   let a = AD.unpack_arr a in
   let shape =
-    if String.(label = "u")
-    then [| setup.n_steps + n_beg - 1; -1 |]
-    else [| setup.n_steps; -1 |]
+    if String.(label = "u") then [| n_steps + n_beg - 1; -1 |] else [| n_steps; -1 |]
   in
   AA.reshape a shape
   |> AA.save_txt ~out:(file ~prefix (Printf.sprintf "%s_%s_%i" prepend label i))
@@ -200,10 +198,10 @@ let save_autonomous_test_ic_results ~prefix prms data =
         Model.sample_generative_autonomous ~noisy:true ~u_init:us_init ~sigma:0.1 ~prms ()
       in
       let prepend = "predicted_auto" in
-      process_gen ~i ~prefix ~prepend "u" u;
-      process_gen ~i ~prefix ~prepend "z" z;
-      process_gen ~i ~prefix ~prepend "o" o;
-      process_gen ~i ~prefix ~prepend "o_noise" (Option.value_exn o_noisy)))
+      process_gen ~i ~n_steps:data_n_steps ~prefix ~prepend "u" u;
+      process_gen ~i ~n_steps:data_n_steps ~prefix ~prepend "z" z;
+      process_gen ~i ~n_steps:data_n_steps ~prefix ~prepend "o" o;
+      process_gen ~i ~n_steps:data_n_steps ~prefix ~prepend "o_noise" (Option.value_exn o_noisy)))
 
 
 (* Simulate from model parameters *)

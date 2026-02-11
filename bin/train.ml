@@ -144,7 +144,7 @@ type init_info =
 (* Compute info needed for initialising parameters *)
 let param_init_info ~dim x =
   (* use a subset of x for computation *)
-  let ids = List.range 0 AA.(shape x).(0) |> List.permute |> List.sub ~pos:0 ~len:5000 in
+  let ids = List.range 0 AA.(shape x).(0) |> List.permute |> List.sub ~pos:0 ~len:1000 in
   let x = AA.get_fancy [ L ids; R []; R [] ] x in
   let pcs = pcs ~dim x in
   let z = z_inferred ~pcs x in
@@ -199,7 +199,7 @@ let tmax, init_info, data_train, train_batch_size, data_save_results, data_test 
 let setup = { n; m; n_trials = train_batch_size; n_steps = tmax }
 let n_beg = Int.(setup.n / setup.m)
 
-module M = Make_model_LDS (struct
+module M = Make_model_MGU (struct
     let setup = setup
     let n_beg = Some n_beg
   end)
@@ -207,18 +207,20 @@ module M = Make_model_LDS (struct
 open M
 
 let reg ~(prms : Model.P.t') =
-  (* if MGU *)
   let z = Float.(1e-5 / of_int Int.(setup.n * setup.n)) in
-  (* let part1 = AD.Maths.(F z * l2norm_sqr' prms.dynamics.uh) in
+  (* if MGU *)
+  
+  let part1 = AD.Maths.(F z * l2norm_sqr' prms.dynamics.uh) in
   let part2 = AD.Maths.(F z * l2norm_sqr' prms.dynamics.uf) in
-  AD.Maths.(part1 + part2) *)
-  let a = prms.dynamics.a in
+  AD.Maths.(part1 + part2)
+  (* if LDS *)
+  (* let a = prms.dynamics.a in
   let a_reg = AD.Maths.(F z * l2norm_sqr' a) in
   match prms.dynamics.b with
   | None -> a_reg
   | Some b ->
     let b_reg = AD.Maths.(F z * l2norm_sqr' b) in
-    AD.Maths.(a_reg + b_reg)
+    AD.Maths.(a_reg + b_reg) *)
 
 
 let reg_arg = if regularise then Some reg else None
@@ -234,7 +236,7 @@ let init_prms () =
     in
     let prior_recog = UR.init ~spatial_std:1.0 ~m () in
     (* if LDS *)
-    let dynamics = D.init ~dt_over_tau:Float.(dt / tau) ~alpha:0.5 ~beta:0.5 ~n ~m () in
+    (* let dynamics = D.init ~dt_over_tau:Float.(dt / tau) ~alpha:0.5 ~beta:0.5 ~n ~m () in
     let dynamics =
       let a =
         match init_info.a_init with
@@ -244,9 +246,9 @@ let init_prms () =
       let b = dynamics.b in
       let b = if pin_b then Option.map ~f:Prms.pin b else b in
       D.P.{ a; b }
-    in
+    in *)
     (* if MGU *)
-    (* let dynamics = D.init ~n ~m () in *)
+    let dynamics = D.init ~n ~m () in
     let likelihood =
       let likelihood_tmp =
         let tmp = L.init ~scale:1. ~sigma2:1. ~n ~n_output () in

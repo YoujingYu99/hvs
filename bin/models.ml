@@ -1,7 +1,6 @@
 open Base
 open Ilqr_vae
 open Misc
-open Vae
 module Mat = Owl.Dense.Matrix.S
 module Arr = Owl.Dense.Ndarray.S
 
