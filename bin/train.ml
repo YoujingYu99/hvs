@@ -5,8 +5,8 @@ open Misc
 open Vae
 open Config
 open Models
-module Mat = Owl.Dense.Matrix.S
-module Arr = Owl.Dense.Ndarray.S
+module Mat = Owl.Dense.Matrix.D
+module Arr = Owl.Dense.Ndarray.D
 
 let _ =
   Random.init 1998;
@@ -32,13 +32,11 @@ let m = Option.value_exn (Cmdargs.get_int "-m")
 let a_init = Cmdargs.get_bool "-a_init" |> Cmdargs.default false
 let c_init = Cmdargs.get_bool "-c_init" |> Cmdargs.default true
 let noise_init = Cmdargs.get_bool "-noise_init" |> Cmdargs.default false
-let pin_prior = Cmdargs.get_bool "-pin_prior" |> Cmdargs.default false
-let pin_b = Cmdargs.get_bool "-pin_b" |> Cmdargs.default false
 
 (* learning rate *)
 let lr = Cmdargs.get_float "-lr" |> Cmdargs.default 0.001
 let decay_rate = Cmdargs.get_float "-decay_rate" |> Cmdargs.default 1.
-let mini_batch = Cmdargs.get_int "-mini_batch" |> Cmdargs.default 10
+let mini_batch = Cmdargs.get_int "-mini_batch" |> Cmdargs.default 32
 let use_early_stopping = Cmdargs.get_bool "-early_stopping" |> Cmdargs.default false
 let regularise = Cmdargs.get_bool "-regularise" |> Cmdargs.default false
 let k = Cmdargs.get_int "-k" |> Cmdargs.default 0
@@ -167,15 +165,16 @@ let param_init_info ~dim x =
   { a_init = a; c_init; noise_init }
 
 
+let load_f32 file = Owl.Dense.Ndarray.Generic.cast_s2d (Owl.Dense.Ndarray.S.load_npy file)
+
 (* Load + preprocess only on rank 0 *)
-let tmax, init_info, data_train, train_batch_size, data_save_results, data_test =
+let tmax, init_info, data_train, data_save_results, data_test =
   C.broadcast' (fun () ->
     (* shape [n_trials x tmax x n_channels ]*)
-    let data_train_npy = Arr.load_npy (data_path ^ "train_std.npy") in
-    let data_test_npy = Arr.load_npy (data_path ^ "test_std.npy") in
+    let data_train_npy = load_f32 (data_path ^ "train_std.npy") in
+    let data_test_npy = load_f32 (data_path ^ "test_std.npy") in
     let data_train_shape = Arr.shape data_train_npy in
-    let train_batch_size = data_train_shape.(0)
-    and tmax = data_train_shape.(1) in
+    let tmax = data_train_shape.(1) in
     print
       [%message
         (Arr.shape data_train_npy : int array) (Arr.shape data_test_npy : int array)];
@@ -190,14 +189,13 @@ let tmax, init_info, data_train, train_batch_size, data_save_results, data_test 
     let data_test = truncate data_test mini_batch in
     let init_info = param_init_info ~dim:n data_train_npy in
     print [%message "Finished computing param init info"];
-    tmax, init_info, data_train, train_batch_size, data_save_results, data_test)
+    tmax, init_info, data_train, data_save_results, data_test)
 
 
 (* -----------------------------------------
    -- Initialise parameters and train
    ----------------------------------------- *)
-let setup = { n; m; nh = 128; n_trials = train_batch_size; n_steps = tmax }
-let n_beg = Int.(setup.n / setup.m)
+let setup = { n; m; nh = 128; dt; n_steps = tmax }
 
 module M = Make_model (struct
     let setup = setup
@@ -207,33 +205,13 @@ open M
 
 let init_prms () =
   C.broadcast' (fun () ->
-    let n = setup.n
-    and m = setup.m in
-    (* optionally pin prior and prior_recog *)
-    let prior =
-      let tmp = U.init ~spatial_std:1.0 ~m () in
-      if pin_prior then U.P.map tmp ~f:Prms.pin else tmp
+    let c =
+      let tmp = L.init ~scale:1. ~sigma2:1. ~n ~n_output () in
+      match init_info.c_init with
+      | None -> AD.unpack_arr (Prms.value tmp.c)
+      | Some c -> c
     in
-    let prior_recog = UR.init ~spatial_std:1.0 ~m () in
-    let dynamics = D.init ~dt ~tau ~n ~nh:setup.nh () in
-    let likelihood =
-      let likelihood_tmp =
-        let tmp = L.init ~scale:1. ~sigma2:1. ~n ~n_output () in
-        let c =
-          match init_info.c_init with
-          | None -> tmp.c
-          | Some c -> Prms.create (AD.pack_arr c)
-        in
-        { tmp with c }
-      in
-      { likelihood_tmp with
-        variances =
-          (match init_info.noise_init with
-           | None -> likelihood_tmp.variances
-           | Some noise_init -> Prms.create (AD.pack_arr noise_init))
-      }
-    in
-    Model.init ~prior ~prior_recog ~dynamics ~likelihood ())
+    M.init ~n_neurons:n_output ~c)
 
 
 let file ~prefix s = prefix ^ "." ^ s
@@ -244,47 +222,47 @@ let save_params ~prefix prms =
     Model.P.save_txt ~prefix prms)
 
 
+let ic_only mu =
+  let open AD.Maths in
+  let mu0 = get_slice [ [ 0 ] ] mu in
+  let rest = AD.Mat.zeros Int.(AD.(shape mu).(0) - 1) AD.(shape mu).(1) in
+  concat ~axis:0 mu0 rest
+
+
 let save_results ~prefix prms data =
+  let process ~id ~prefix label a =
+    a
+    |> AD.unpack_arr
+    |> (fun z -> AA.reshape z [| setup.n_steps; -1 |])
+    |> AA.save_txt ~out:(file ~prefix (Printf.sprintf "predicted_%s_%i" label id))
+  in
   save_params ~prefix prms;
   let prms = Model.P.value prms in
   (* sample from model parameters *)
-  (* List.iter (List.range 0 n_trials_save) ~f:(fun i ->
+  List.iter (List.range 0 n_trials_save) ~f:(fun i ->
     if Int.(i % C.n_nodes = C.rank)
     then (
-      let u, z, o, o_noisy = Model.sample_generative ~prms in
-      let process_gen label a =
-        let a = AD.unpack_arr a in
-        let shape =
-          if String.(label = "u")
-          then [| setup.n_steps + n_beg - 1; -1 |]
-          else [| setup.n_steps; -1 |]
-        in
-        AA.reshape a shape
-        |> AA.save_txt ~out:(file ~prefix (Printf.sprintf "generated_%s_%i" label i))
-      in
-      process_gen "u" u;
-      process_gen "z" z;
-      process_gen "o" o;
-      process_gen "o_noise" (Option.value_exn o_noisy))); *)
-  (* sample from model using inferred u *)
+      let { u; z; o } = Model.sample_generative ~prms in
+      process ~id:i ~prefix "generated_u" (Option.value_exn u);
+      process ~id:i ~prefix "generated_z" (Option.value_exn z);
+      process ~id:i ~prefix "generated_o" o));
   Array.iteri data ~f:(fun i dat_trial ->
     if Int.(i % C.n_nodes = C.rank)
     then (
-      let mu = Model.posterior_mean ~prms dat_trial in
+      let mu : AD.t = Model.posterior_mean ~prms dat_trial in
+      let us, zs, os = Model.predictions_deterministic ~prms mu in
+      let us0, zs0, os0 = Model.predictions_deterministic ~prms (ic_only mu) in
       AA.save_txt
         ~out:(file ~prefix (Printf.sprintf "posterior_u_%i" i))
         (AD.unpack_arr mu);
-      let us, zs, os = Model.predictions ~n_samples ~prms mu in
-      let process ?(shape = [| setup.n_steps; -1 |]) label a =
-        let a = AD.unpack_arr a in
-        AA.(mean ~axis:2 a @|| var ~axis:2 a)
-        |> (fun z -> AA.reshape z shape)
-        |> AA.save_txt ~out:(file ~prefix (Printf.sprintf "predicted_%s_%i" label i))
-      in
-      process "u" us;
-      process "z" zs;
-      assert (Array.length os = 1);
-      Array.iter ~f:(fun (label, x) -> process label x) os))
+      (* model inferred u *)
+      process ~id:i ~prefix "u" us;
+      process ~id:i ~prefix "z" zs;
+      process ~id:i ~prefix "o" (snd os.(0));
+      (* autonomous ic *)
+      process ~id:i ~prefix "ic_u" us0;
+      process ~id:i ~prefix "ic_z" zs0;
+      process ~id:i ~prefix "ic_o" (snd os0.(0))))
 
 
 module Optimizer = Opt.Adam.Make (Model.P)
@@ -323,7 +301,7 @@ let rec iter ~k ~state_early_stop ~curr_best state =
   let reached_best, curr_best, stop_test, state_early_stop =
     if Int.(k % 100 = 0)
     then (
-      (* let test_loss =
+      let test_loss =
         Model.elbo_no_gradient
           ~n_samples
           ~conv_threshold:1E-4
@@ -338,22 +316,22 @@ let rec iter ~k ~state_early_stop ~curr_best state =
            then true, Some test_loss
            else false, Some curr_best)
         |> C.broadcast
-      in *)
+      in
       if C.first
-      then
-        Optimizer.save ~out:(in_dir "state.bin") state
-        (* AA.(
+      then (
+        Optimizer.save ~out:(in_dir "state.bin") state;
+        AA.(
           save_txt
             ~append:true
             ~out:(in_dir "test_loss")
-            (of_array [| Float.of_int k; test_loss |] [| 1; 2 |])) *);
+            (of_array [| Float.of_int k; test_loss |] [| 1; 2 |])));
       save_results ~prefix:(in_dir "final") prms data_save_results;
-      (* let stop_early, state_early_stop =
+      let stop_early, state_early_stop =
         match state_early_stop with
         | Some state_early_stop -> check_early_stop ~state:state_early_stop test_loss
         | None -> false, None
-      in *)
-      true, curr_best, false, state_early_stop)
+      in
+      reached_best, curr_best, stop_early, state_early_stop)
     else false, curr_best, false, state_early_stop
   in
   if reached_best then save_results ~prefix:(in_dir "best") prms data_save_results;
@@ -408,17 +386,15 @@ let final_prms =
 let _ = save_results ~prefix:(in_dir "final") final_prms data_save_results
 
 (* Compute final validation loss from available models *)
-(* let _ =
-  let (prms_final ) =
-    C.broadcast' (fun () -> Misc.read_bin (in_dir "final.params.bin") )
-  in
+let _ =
+  let prms_final = C.broadcast' (fun () -> Misc.read_bin (in_dir "final.params.bin")) in
   let test_loss =
-    Model.elbo_gradient ~n_samples ~conv_threshold:1E-4 prms_final data_test *)
-(* in
+    Model.elbo_no_gradient ~n_samples ~conv_threshold:1E-4 prms_final data_test
+  in
   if C.first
   then
     AA.(
       save_txt
         ~append:true
         ~out:(in_dir "final_test_loss")
-        (of_array [| test_loss |] [| 1; 1 |])) *)
+        (of_array [| test_loss |] [| 1; 1 |]))
