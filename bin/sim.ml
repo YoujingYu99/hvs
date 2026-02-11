@@ -66,15 +66,15 @@ let load_f32 file = Owl.Dense.Ndarray.Generic.cast_s2d (Owl.Dense.Ndarray.S.load
 let data_save_results, data_n_steps =
   C.broadcast' (fun () ->
     (* shape [n_trials x tmax x n_channels ]*)
-    let data_test_npy = load_f32 (data_path ^ "train_std.npy") in
-    let data_train_shape = Arr.shape data_test_npy in
-    let data_n_steps = data_train_shape.(1) in
+    let data_test_npy = load_f32 (data_path ^ "test_std.npy") in
+    let data_test_shape = Arr.shape data_test_npy in
+    let data_n_steps = data_test_shape.(1) in
     print [%message (Arr.shape data_test_npy : int array)];
-    let data_train = pack_data data_test_npy in
+    let data_test = pack_data data_test_npy in
     let data_save_results =
-      List.permute (List.range 0 data_train_shape.(0))
+      List.permute (List.range 0 data_test_shape.(0))
       |> List.sub ~pos:0 ~len:n_trials_save
-      |> List.map ~f:(fun i -> data_train.(i))
+      |> List.map ~f:(fun i -> data_test.(i))
       |> List.to_array
     in
     data_save_results, data_n_steps)
