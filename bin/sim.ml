@@ -40,12 +40,11 @@ let save_generative_autonomous_inferred =
    -- Initialise parameters and train
    ----------------------------------------- *)
 
-let setup = { n; m; n_trials = n_trials_save; n_steps }
+let setup = { n; m; nh = 128; n_trials = n_trials_save; n_steps }
 let n_beg = Int.(setup.n / setup.m)
 
-module M = Make_model_LDS (struct
+module M = Make_model (struct
     let setup = setup
-    let n_beg = Some n_beg
   end)
 
 let pack_o o = { Vae.u = None; z = None; o = AD.pack_arr o }
@@ -97,7 +96,7 @@ let process_gen ~i ?(n_steps = setup.n_steps) ~prefix ~prepend label a =
   |> AA.save_txt ~out:(file ~prefix (Printf.sprintf "%s_%s_%i" prepend label i))
 
 
-let save_generative_results ~prefix prms =
+(* let save_generative_results ~prefix prms =
   let prepend = "generated" in
   let open M in
   (* sample from model parameters *)
@@ -108,10 +107,9 @@ let save_generative_results ~prefix prms =
       process_gen ~i ~prefix ~prepend "u" u;
       process_gen ~i ~prefix ~prepend "z" z;
       process_gen ~i ~prefix ~prepend "o" o;
-      process_gen ~i ~prefix ~prepend "o_noise" (Option.value_exn o_noisy)))
+      process_gen ~i ~prefix ~prepend "o_noise" (Option.value_exn o_noisy))) *)
 
-
-let save_autonomous_generative_results ~prefix prms =
+(* let save_autonomous_generative_results ~prefix prms =
   let prepend = "generated_autonomous" in
   let open M in
   (* sample from model parameters *)
@@ -124,10 +122,9 @@ let save_autonomous_generative_results ~prefix prms =
       process_gen ~i ~prefix ~prepend "u" u;
       process_gen ~i ~prefix ~prepend "z" z;
       process_gen ~i ~prefix ~prepend "o" o;
-      process_gen ~i ~prefix ~prepend "o_noise" (Option.value_exn o_noisy)))
+      process_gen ~i ~prefix ~prepend "o_noise" (Option.value_exn o_noisy))) *)
 
-
-let save_impulse_response ~prefix prms =
+(* let save_impulse_response ~prefix prms =
   let open M in
   let prepend = Printf.sprintf "impulse_channel" in
   let n_sim = Int.(setup.n_steps + n_beg - 1) in
@@ -157,15 +154,13 @@ let save_impulse_response ~prefix prms =
       process_gen ~i ~prefix ~prepend "u" u_impulse;
       process_gen ~i ~prefix ~prepend "z" z_impulse;
       process_gen ~i ~prefix ~prepend "o" o_impulse;
-      process_gen ~i ~prefix ~prepend "o_noise" (Option.value_exn o_noisy_impulse)))
-
+      process_gen ~i ~prefix ~prepend "o_noise" (Option.value_exn o_noisy_impulse))) *)
 
 let save_autonomous_test_ic_results ~prefix prms data =
-  let setup = { n; m; n_trials = n_trials_save; n_steps = data_n_steps } in
+  let setup = { n; m; nh = 128; n_trials = n_trials_save; n_steps = data_n_steps } in
   let module M_D =
-    Make_model_LDS (struct
+    Make_model (struct
       let setup = setup
-      let n_beg = Some n_beg
     end)
   in
   let open M_D in
@@ -177,7 +172,7 @@ let save_autonomous_test_ic_results ~prefix prms data =
       AA.save_txt
         ~out:(file ~prefix (Printf.sprintf "posterior_u_%i" i))
         (AD.unpack_arr mu);
-      let u_inits, us, zs, os = Model.predictions ~n_samples ~prms mu in
+      let us, zs, os = Model.predictions ~n_samples ~prms mu in
       let process ?(shape = [| data_n_steps; -1 |]) label a =
         let a = AD.unpack_arr a in
         AA.(mean ~axis:2 a @|| var ~axis:2 a)
@@ -191,17 +186,7 @@ let save_autonomous_test_ic_results ~prefix prms data =
         ~out:(file ~prefix (Printf.sprintf "predicted_o_data_%i" i))
         (AD.unpack_arr dat_trial.o);
       assert (Array.length os = 1);
-      Array.iter ~f:(fun (label, x) -> process label x) os;
-      (* u_init for init cond then autonomous dynamics *)
-      let us_init = u_inits |> AD.unpack_arr |> AA.mean ~axis:2 ~keep_dims:false in
-      let u, z, o, o_noisy =
-        Model.sample_generative_autonomous ~noisy:true ~u_init:us_init ~sigma:0.1 ~prms ()
-      in
-      let prepend = "predicted_auto" in
-      process_gen ~i ~n_steps:data_n_steps ~prefix ~prepend "u" u;
-      process_gen ~i ~n_steps:data_n_steps ~prefix ~prepend "z" z;
-      process_gen ~i ~n_steps:data_n_steps ~prefix ~prepend "o" o;
-      process_gen ~i ~n_steps:data_n_steps ~prefix ~prepend "o_noise" (Option.value_exn o_noisy)))
+      Array.iter ~f:(fun (label, x) -> process label x) os))
 
 
 (* Simulate from model parameters *)
@@ -213,6 +198,7 @@ let _ =
   in
   if save_generative_autonomous
   then
+    (* then
     save_autonomous_generative_results
       ~prefix:(in_dir chkpt_type ^ "_t_" ^ Int.to_string n_steps)
       prms;
@@ -225,4 +211,5 @@ let _ =
   then
     save_impulse_response ~prefix:(in_dir chkpt_type ^ "_t_" ^ Int.to_string n_steps) prms;
   if save_generative_autonomous_inferred
-  then save_autonomous_test_ic_results ~prefix:(in_dir chkpt_type) prms data_save_results
+  then  *)
+    save_autonomous_test_ic_results ~prefix:(in_dir chkpt_type) prms data_save_results
