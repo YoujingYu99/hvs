@@ -222,10 +222,10 @@ let save_params ~prefix prms =
     Model.P.save_txt ~prefix prms)
 
 
-let ic_only mu =
+let ic_only ~n_steps mu =
   let open AD.Maths in
   let mu0 = get_slice [ [ 0 ] ] mu in
-  let rest = AD.Mat.zeros Int.(AD.(shape mu).(0) - 1) AD.(shape mu).(1) in
+  let rest = AD.Mat.zeros Int.(n_steps - 1) AD.(shape mu).(1) in
   concat ~axis:0 mu0 rest
 
 
@@ -251,7 +251,9 @@ let save_results ~prefix prms data =
     then (
       let mu : AD.t = Model.posterior_mean ~prms dat_trial in
       let us, zs, os = Model.predictions_deterministic ~prms mu in
-      let us0, zs0, os0 = Model.predictions_deterministic ~prms (ic_only mu) in
+      let us0, zs0, os0 =
+        Model.predictions_deterministic ~prms (ic_only ~n_steps:setup.n_steps mu)
+      in
       AA.save_txt
         ~out:(file ~prefix (Printf.sprintf "posterior_u_%i" i))
         (AD.unpack_arr mu);

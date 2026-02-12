@@ -27,7 +27,7 @@ let chkpt_type = Cmdargs.get_string "-chkpt_type" |> Cmdargs.default "best"
 let save_generative = Cmdargs.get_bool "-save_generative" |> Cmdargs.default true
 
 let save_generative_autonomous_inferred =
-  Cmdargs.get_bool "-save_generative_autonomous_inferred" |> Cmdargs.default false
+  Cmdargs.get_bool "-save_generative_autonomous_inferred" |> Cmdargs.default true
 
 
 (* -----------------------------------------
@@ -102,21 +102,14 @@ let save_generative_results ~prefix prms =
       process_gen ~i ~prefix ~prepend "o" o))
 
 
-let ic_only mu =
+let ic_only ~n_steps mu =
   let open AD.Maths in
   let mu0 = get_slice [ [ 0 ] ] mu in
-  let rest = AD.Mat.zeros Int.(AD.(shape mu).(0) - 1) AD.(shape mu).(1) in
+  let rest = AD.Mat.zeros Int.(n_steps - 1) AD.(shape mu).(1) in
   concat ~axis:0 mu0 rest
 
 
 let save_autonomous_test_ic_results ~prefix prms data =
-  let setup = { n; m; nh = 128; dt; n_steps = data_n_steps } in
-  let module M_D =
-    Make_model (struct
-      let setup = setup
-    end)
-  in
-  let open M_D in
   let process ~id ~prefix label a =
     a
     |> AD.unpack_arr
@@ -127,9 +120,23 @@ let save_autonomous_test_ic_results ~prefix prms data =
   Array.iteri data ~f:(fun i dat_trial ->
     if Int.(i % C.n_nodes = C.rank)
     then (
+      let setup = { n; m; nh = 128; dt; n_steps = data_n_steps } in
+      let module M_D =
+        Make_model (struct
+          let setup = setup
+        end)
+      in
+      let open M_D in
       let mu : AD.t = Model.posterior_mean ~prms dat_trial in
       let us, zs, os = Model.predictions_deterministic ~prms mu in
-      let us0, zs0, os0 = Model.predictions_deterministic ~prms (ic_only mu) in
+      let setup = { n; m; nh = 128; dt; n_steps } in
+      let module M_D =
+        Make_model (struct
+          let setup = setup
+        end)
+      in
+      let open M_D in
+      let us0, zs0, os0 = Model.predictions_deterministic ~prms (ic_only ~n_steps mu) in
       AA.save_txt
         ~out:(file ~prefix (Printf.sprintf "posterior_u_%i" i))
         (AD.unpack_arr mu);
@@ -148,7 +155,10 @@ let _ =
   let open M in
   let (prms : Model.P.t') =
     C.broadcast' (fun () ->
-      Misc.read_bin (in_dir chkpt_type ^ ".params.bin") |> Model.P.value)
+      Misc.read_bin
+        (* (in_dir chkpt_type ^ ".params.bin") *)
+        (in_dir "guillaume_trained_params.bin")
+      |> Model.P.value)
   in
   if save_generative
   then
