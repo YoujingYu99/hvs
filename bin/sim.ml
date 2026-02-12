@@ -27,7 +27,7 @@ let chkpt_type = Cmdargs.get_string "-chkpt_type" |> Cmdargs.default "best"
 let save_generative = Cmdargs.get_bool "-save_generative" |> Cmdargs.default true
 
 let save_generative_autonomous_inferred =
-  Cmdargs.get_bool "-save_generative_autonomous_inferred" |> Cmdargs.default false
+  Cmdargs.get_bool "-save_generative_autonomous_inferred" |> Cmdargs.default true
 
 
 (* -----------------------------------------
@@ -37,7 +37,7 @@ let save_generative_autonomous_inferred =
 let setup = { n; m; n_trials = n_trials_save; n_steps }
 let n_beg = Int.(setup.n / setup.m)
 
-module M = Make_model_MGU (struct
+module M = Make_model_LDS (struct
     let setup = setup
     let n_beg = Some n_beg
   end)
@@ -102,35 +102,36 @@ let save_generative_results ~prefix prms =
       process_gen ~i ~prefix ~prepend "o" o))
 
 
-let ic_only mu =
+let ic_only ~n_steps mu =
   let open AD.Maths in
   let mu0 = get_slice [ [ 0 ] ] mu in
-  let rest = AD.Mat.zeros Int.(AD.(shape mu).(0) - 1) AD.(shape mu).(1) in
+  let rest = AD.Mat.zeros Int.(n_steps - 1) AD.(shape mu).(1) in
   concat ~axis:0 mu0 rest
 
 
 let save_autonomous_test_ic_results ~prefix prms data =
-  let setup = { n; m; n_trials = n_trials_save; n_steps = data_n_steps } in
-  let module M_D =
-    Make_model_MGU (struct
-      let setup = setup
-      let n_beg = Some n_beg
-    end)
-  in
-  let open M_D in
   let process ~id ~prefix label a =
+    let t = (AA.shape (AD.unpack_arr a)).(0) in
     a
     |> AD.unpack_arr
-    |> (fun z -> AA.reshape z [| setup.n_steps; -1 |])
+    |> (fun z -> AA.reshape z [| t; -1 |])
     |> AA.save_txt ~out:(file ~prefix (Printf.sprintf "predicted_%s_%i" label id))
   in
   (* sample from model using inferred u *)
   Array.iteri data ~f:(fun i dat_trial ->
     if Int.(i % C.n_nodes = C.rank)
     then (
+      let setup = { n; m; n_trials = n_trials_save; n_steps = data_n_steps } in
+      let module M_D =
+        Make_model_LDS (struct
+          let setup = setup
+          let n_beg = Some n_beg
+        end)
+      in
+      let open M_D in
       let mu : AD.t = Model.posterior_mean ~prms dat_trial in
+      print [%message "posterior comp done"];
       let us, zs, os = Model.predictions_deterministic ~prms mu in
-      let us0, zs0, os0 = Model.predictions_deterministic ~prms (ic_only mu) in
       AA.save_txt
         ~out:(file ~prefix (Printf.sprintf "posterior_u_%i" i))
         (AD.unpack_arr mu);
@@ -138,6 +139,15 @@ let save_autonomous_test_ic_results ~prefix prms data =
       process ~id:i ~prefix "u" us;
       process ~id:i ~prefix "z" zs;
       process ~id:i ~prefix "o" (snd os.(0));
+      let setup = { n; m; n_trials = n_trials_save; n_steps } in
+      let module M_D =
+        Make_model_LDS (struct
+          let setup = setup
+          let n_beg = Some n_beg
+        end)
+      in
+      let open M_D in
+      let us0, zs0, os0 = Model.predictions_deterministic ~prms (ic_only ~n_steps mu) in
       (* autonomous ic *)
       process ~id:i ~prefix "ic_u" us0;
       process ~id:i ~prefix "ic_z" zs0;
