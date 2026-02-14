@@ -196,23 +196,23 @@ let tmax, init_info, data_train, train_batch_size, data_save_results, data_test 
 (* -----------------------------------------
    -- Initialise parameters and train
    ----------------------------------------- *)
-let setup = { n; m; n_trials = train_batch_size; n_steps = tmax }
+let setup = { n; m; n_steps = tmax; dt; nh = 128 }
 let n_beg = Int.(setup.n / setup.m)
 
-module M = Make_model_MGU (struct
+module M = Make_model_GNODE (struct
     let setup = setup
     let n_beg = Some n_beg
   end)
 
 open M
 
-let reg ~(prms : Model.P.t') =
+(* if mgu *)
+(* let reg ~(prms : Model.P.t') =
   let z = Float.(1e-5 / of_int Int.(setup.n * setup.n)) in
   (* if MGU *)
   let part1 = AD.Maths.(F z * l2norm_sqr' prms.dynamics.uh) in
   let part2 = AD.Maths.(F z * l2norm_sqr' prms.dynamics.uf) in
-  AD.Maths.(part1 + part2)
-
+  AD.Maths.(part1 + part2) *)
 
 (* if LDS *)
 (* let a = prms.dynamics.a in
@@ -222,6 +222,18 @@ let reg ~(prms : Model.P.t') =
   | Some b ->
     let b_reg = AD.Maths.(F z * l2norm_sqr' b) in
     AD.Maths.(a_reg + b_reg) *)
+
+(* if GNODE *)
+let reg ~(prms : Model.P.t') =
+  let z = Float.(1e-5 / of_int Int.(setup.n * setup.n)) in
+  (* if MGU *)
+  let part1 = AD.Maths.(F z * l2norm_sqr' prms.dynamics.g_a1) in
+  let part2 = AD.Maths.(F z * l2norm_sqr' prms.dynamics.h_a1) in
+  let part3 = AD.Maths.(F z * l2norm_sqr' prms.dynamics.h_a2) in
+  AD.Maths.(part1 + part2 + part3)
+
+
+open M
 
 let reg_arg = if regularise then Some reg else None
 
@@ -248,7 +260,9 @@ let init_prms () =
       D.P.{ a; b }
     in *)
     (* if MGU *)
-    let dynamics = D.init ~n ~m () in
+    (* let dynamics = D.init ~n ~m () in *)
+    (* if GNODE *)
+    let dynamics = D.init ~n ~m ~nh:setup.nh ~dt ~tau () in
     let likelihood =
       let likelihood_tmp =
         let tmp = L.init ~scale:1. ~sigma2:1. ~n ~n_output () in
@@ -277,10 +291,10 @@ let save_params ~prefix prms =
     Model.P.save_txt ~prefix prms)
 
 
-let process_gen ~i ?(n_steps = setup.n_steps) ~prefix ~prepend label a =
+let process_gen ~i ~prefix ~prepend label a =
   let a = AD.unpack_arr a in
-  let shape = if String.(label = "u") then [| n_steps; -1 |] else [| n_steps; -1 |] in
-  AA.reshape a shape
+  let n_steps = (AA.shape a).(0) in
+  AA.reshape a [| n_steps; -1 |]
   |> AA.save_txt ~out:(file ~prefix (Printf.sprintf "%s_%s_%i" prepend label i))
 
 
@@ -308,7 +322,7 @@ let save_autonomous_test_ic_results ~prefix prms data =
   let process ~id ~prefix label a =
     a
     |> AD.unpack_arr
-    |> (fun z -> AA.reshape z [| setup.n_steps; -1 |])
+    |> (fun z -> AA.reshape z [| AA.(shape (AD.unpack_arr a)).(0); -1 |])
     |> AA.save_txt ~out:(file ~prefix (Printf.sprintf "predicted_%s_%i" label id))
   in
   (* sample from model using inferred u *)

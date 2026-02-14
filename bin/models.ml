@@ -9,9 +9,10 @@ module Arr = Owl.Dense.Ndarray.S
     ----------------------------------------- *)
 type setup =
   { n : int
+  ; nh : int
   ; m : int
-  ; n_trials : int
   ; n_steps : int
+  ; dt : float
   }
 
 module Make_model_LDS (P : sig
@@ -85,4 +86,50 @@ struct
         let diag_time_cov = false
         let n_beg = P.n_beg
       end)
+end
+
+module Make_model_GNODE (P : sig
+    val setup : setup
+    val n_beg : int Option.t
+  end) =
+struct
+  module U = Prior.Student (struct
+      let n_beg = P.n_beg
+    end)
+
+  module UR = Prior.Student (struct
+      let n_beg = P.n_beg
+    end)
+
+  module L = Likelihood.Gaussian (struct
+      let label = "o"
+      let normalize_c = false
+    end)
+
+  module D = Dynamics.GNODE (struct
+      let phi = AD.requad, AD.d_requad
+      let n_beg = P.n_beg
+    end)
+
+  module Model =
+    Vae.Make (U) (UR) (D) (L)
+      (struct
+        let n = P.setup.n
+        let m = P.setup.m
+        let n_steps = P.setup.n_steps
+        let diag_time_cov = false
+        let n_beg = P.n_beg
+      end)
+
+  let init ~n_neurons ~c =
+    let n = P.setup.n
+    and nh = P.setup.nh
+    and m = P.setup.m in
+    let prior_recog = U.init ~spatial_std:1.0 ~m () in
+    let dynamics = D.init ~radius:1. ~dt:P.setup.dt ~tau:0.1 ~n ~m ~nh () in
+    let likelihood =
+      let likelihood = L.init ~n:P.setup.n ~n_output:n_neurons () in
+      { likelihood with c = Prms.free AD.Maths.(F 0.1 * AD.pack_arr c) }
+    in
+    Model.init ~prior_recog ~dynamics ~likelihood ()
 end

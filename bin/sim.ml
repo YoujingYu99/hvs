@@ -34,10 +34,10 @@ let save_generative_autonomous_inferred =
    -- Initialise parameters and train
    ----------------------------------------- *)
 
-let setup = { n; m; n_trials = n_trials_save; n_steps }
+let setup = { n; m; n_steps; dt; nh = 128 }
 let n_beg = Int.(setup.n / setup.m)
 
-module M = Make_model_LDS (struct
+module M = Make_model_GNODE (struct
     let setup = setup
     let n_beg = Some n_beg
   end)
@@ -84,8 +84,8 @@ let file ~prefix s = prefix ^ "." ^ s
 
 let process_gen ~i ?(n_steps = setup.n_steps) ~prefix ~prepend label a =
   let a = AD.unpack_arr a in
-  let shape = if String.(label = "u") then [| n_steps; -1 |] else [| n_steps; -1 |] in
-  AA.reshape a shape
+  let n_steps = (AA.shape a).(0) in
+  AA.reshape a [| n_steps; -1 |]
   |> AA.save_txt ~out:(file ~prefix (Printf.sprintf "%s_%s_%i" prepend label i))
 
 
@@ -121,16 +121,15 @@ let save_autonomous_test_ic_results ~prefix prms data =
   Array.iteri data ~f:(fun i dat_trial ->
     if Int.(i % C.n_nodes = C.rank)
     then (
-      let setup = { n; m; n_trials = n_trials_save; n_steps = data_n_steps } in
+      let setup = { n; m; n_steps = data_n_steps; dt; nh = 128 } in
       let module M_D =
-        Make_model_LDS (struct
+        Make_model_GNODE (struct
           let setup = setup
           let n_beg = Some n_beg
         end)
       in
       let open M_D in
       let mu : AD.t = Model.posterior_mean ~prms dat_trial in
-      print [%message "posterior comp done"];
       let us, zs, os = Model.predictions_deterministic ~prms mu in
       AA.save_txt
         ~out:(file ~prefix (Printf.sprintf "posterior_u_%i" i))
@@ -139,9 +138,9 @@ let save_autonomous_test_ic_results ~prefix prms data =
       process ~id:i ~prefix "u" us;
       process ~id:i ~prefix "z" zs;
       process ~id:i ~prefix "o" (snd os.(0));
-      let setup = { n; m; n_trials = n_trials_save; n_steps } in
+      let setup = { n; m; n_steps = data_n_steps; dt; nh = 128 } in
       let module M_D =
-        Make_model_LDS (struct
+        Make_model_GNODE (struct
           let setup = setup
           let n_beg = Some n_beg
         end)
